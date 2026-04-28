@@ -165,7 +165,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
           if (chunk.choices?.length) {
             for (const choice of chunk.choices) {
               const d = choice.delta;
-              if (d && ((d.content != null && d.content !== "") || d.tool_calls?.length)) {
+              if (d && ((d.content != null && d.content !== "") || (d.reasoning_content != null && d.reasoning_content !== "") || d.tool_calls?.length)) {
                 hasContent = true;
               }
             }

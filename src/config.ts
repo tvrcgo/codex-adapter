@@ -33,6 +33,7 @@ interface RawBackend {
   max_tokens?: number;
   extra_headers?: Record<string, string>;
   extra_body?: Record<string, unknown>;
+  strip_params?: string[];
 }
 
 interface RawConfig {
@@ -57,6 +58,7 @@ function parseBackend(b: RawBackend, index: number): BackendConfig {
     maxTokens: b.max_tokens,
     extraHeaders: b.extra_headers,
     extraBody: b.extra_body ?? defaultExtraBody,
+    stripParams: b.strip_params,
   };
 }
 
