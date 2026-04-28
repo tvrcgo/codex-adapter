@@ -1,0 +1,8 @@
+node_modules/
+dist/
+logs/
+test/
+
+.env
+config.yml
+!config.example.yml
