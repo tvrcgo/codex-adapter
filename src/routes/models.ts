@@ -5,13 +5,15 @@ export function createModelsRouter(config: AdapterConfig): Router {
   const router = Router();
 
   router.get("/v1/models", (_req: Request, res: Response) => {
-    const data = config.backends.map((b) => ({
-      id: b.model,
-      object: "model",
-      created: Math.floor(Date.now() / 1000),
-      owned_by: b.name,
-      ...(b.maxTokens ? { max_input_tokens: b.maxTokens } : {}),
-    }));
+    const data = config.backends.flatMap((b) =>
+      b.models.map((m) => ({
+        id: m,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: b.name,
+        ...(b.maxTokens ? { max_input_tokens: b.maxTokens } : {}),
+      })),
+    );
 
     if (data.length === 0) {
       data.push({

@@ -19,10 +19,9 @@ export function transformRequest(
   backend: BackendConfig,
 ): ChatCompletionsRequest {
   const messages = buildMessages(body);
-  const model = backend.model ?? body.model;
 
   const req: ChatCompletionsRequest = {
-    model,
+    model: body.model,
     messages,
     stream: true,
   };

@@ -9,8 +9,7 @@ backends:
   - name: my-backend           # 后端名称（用于日志和路由）
     model: my-model             # 对应的 model 名称
     default: true               # 标记为默认后端（未匹配时使用）
-    base_url: http://localhost:8000/v1
-    completions_path: /chat/completions
+    url: http://localhost:8000/v1/chat/completions
     api_key: your-api-key
     # max_tokens: 128000        # 上下文 token 上限
 
@@ -23,8 +22,7 @@ backends:
 
   # - name: another-backend
   #   model: another-model
-  #   base_url: https://api.example.com/v1
-  #   completions_path: /chat/completions
+  #   url: https://api.example.com/v1/chat/completions
   #   api_key: another-key
   #   max_tokens: 64000
   #   extra_body:

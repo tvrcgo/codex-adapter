@@ -1,80 +1,79 @@
 # codex-adapter
 
-Proxy that translates OpenAI **Responses API** requests (from Codex CLI) into **Chat Completions** format for internal backends that only support `/v1/chat/completions`.
+Proxy that translates OpenAI **Responses API** into **Chat Completions API**, enabling [Codex App](https://github.com/openai/codex) to work with any OpenAI-compatible backend.
+
+[中文文档](README.zh-CN.md)
 
 ```
-Codex CLI ──(POST /v1/responses)──▶ codex-adapter ──(POST /v1/chat/completions)──▶ Internal API
+Codex App ──(Responses API)──▶ codex-adapter ──(Chat Completions API)──▶ Backend
 ```
 
-## Quick Start
+## Features
+
+- Bidirectional SSE stream translation (Responses API ↔ Chat Completions)
+- Function calling / tool use with multi-tool batching
+- Multiple backends with model-based routing
+- Custom headers and body fields per backend
+- Empty response detection → `context_length_exceeded` error for auto-compaction
+
+## Configuration
+
+Create `config.yml` from the example:
 
 ```bash
-npm install
-npm run build
+cp config.example.yml config.yml
 ```
 
-Copy `.env.example` to `.env` and fill in your values:
+```yaml
+port: 3321
+log_level: info
+
+backends:
+  - name: backend-a
+    model: model-a            # single model
+    default: true
+    url: https://api.example.com/v1/chat/completions
+    api_key: your-key
+    max_tokens: 128000
+    extra_body:
+      stream_options:
+        include_usage: true
+
+  - name: backend-b
+    models:                   # multiple models
+      - model-b
+      - model-b-fast
+    url: https://other-api.example.com/v1/chat/completions
+    api_key: another-key
+    max_tokens: 64000
+```
+
+Requests are routed by the `model` field: match → corresponding backend, no match → `default` backend, no default → first in list.
+
+## Docker
 
 ```bash
-cp .env.example .env
+cp config.example.yml config.yml   # edit with your settings
+docker-compose up -d --build
 ```
 
-See [.env.example](.env.example) for all available configuration options.
+`config.yml` is baked into the image. Rebuild after changes.
 
-Start the server:
-
-```bash
-npm start         # production (requires build)
-npm run dev       # development with hot-reload
-```
-
-## Codex CLI Configuration
+## Codex CLI Setup
 
 ```toml
 # ~/.codex/config.toml
-model_provider = "internal"
+model = "model-a"
+model_provider = "adapter"
+model_context_window = 128000      # enables auto-compaction
 
-[model_providers.internal]
-name = "Internal API"
+[model_providers.adapter]
+name = "codex-adapter"
 base_url = "http://localhost:3321/v1"
-env_key = "CODEX_ADAPTER_KEY"
+env_key = "ADAPTER_API_KEY"
 wire_api = "responses"
 ```
 
-## Endpoints
+## License
 
-| Endpoint | Description |
-|---|---|
-| `POST /v1/responses` | Accepts Responses API requests, translates and streams |
-| `GET /v1/responses/:id` | Returns 404 (stateless proxy) |
-| `GET /v1/models` | Lists available models |
-| `GET /health` | Health check |
-
-## Custom Backend Fields
-
-By default the adapter injects these extra fields into every Chat Completions request:
-
-```json
-{
-  "chat_template_kwargs": { "enable_thinking": false },
-  "stream_options": { "include_usage": true }
-}
-```
-
-Override via `ADAPTER_EXTRA_BODY` environment variable (JSON string).
-
-## What's Supported
-
-- Text generation (streaming)
-- Function calling / tool use (streaming)
-- System instructions (`instructions` → system message)
-- Structured outputs (`text.format` → `response_format`)
-- Multi-turn conversations via full input array
-- Custom headers and body fields injection
-
-## What's Not Supported
-
-- `previous_response_id` chaining (Codex sends full context)
-- Hosted tools (web_search, file_search, code_interpreter)
-- Response storage / retrieval
-- Image generation
+MIT

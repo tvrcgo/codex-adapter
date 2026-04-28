@@ -4,9 +4,8 @@ import yaml from "js-yaml";
 
 export interface BackendConfig {
   name: string;
-  model: string;
-  baseUrl: string;
-  completionsPath: string;
+  models: string[];
+  url: string;
   apiKey: string;
   maxTokens?: number;
   extraHeaders?: Record<string, string>;
@@ -27,9 +26,9 @@ const defaultExtraBody = {
 interface RawBackend {
   name?: string;
   model?: string;
+  models?: string[];
   default?: boolean;
-  base_url?: string;
-  completions_path?: string;
+  url?: string;
   api_key?: string;
   max_tokens?: number;
   extra_headers?: Record<string, string>;
@@ -40,18 +39,20 @@ interface RawConfig {
   port?: number;
   log_level?: string;
   backends?: RawBackend[];
-  // legacy single-backend format
-  backend?: RawBackend & { model?: string };
-  models?: string[];
+}
+
+function parseModels(b: RawBackend, index: number): string[] {
+  if (b.models?.length) return b.models;
+  if (b.model) return [b.model];
+  return [`model-${index}`];
 }
 
 function parseBackend(b: RawBackend, index: number): BackendConfig {
-  const model = b.model ?? `model-${index}`;
+  const models = parseModels(b, index);
   return {
-    name: b.name ?? model,
-    model,
-    baseUrl: b.base_url ?? "http://localhost:8000",
-    completionsPath: b.completions_path ?? "/chat/completions",
+    name: b.name ?? models[0],
+    models,
+    url: b.url ?? "http://localhost:8000/v1/chat/completions",
     apiKey: b.api_key ?? "",
     maxTokens: b.max_tokens,
     extraHeaders: b.extra_headers,
@@ -64,7 +65,7 @@ export function resolveBackend(config: AdapterConfig, modelName?: string): Backe
     return config.backends.find((b) => b.name === config.defaultBackend) ?? config.backends[0];
   }
   return (
-    config.backends.find((b) => b.model === modelName) ??
+    config.backends.find((b) => b.models.includes(modelName)) ??
     config.backends.find((b) => b.name === modelName) ??
     config.backends.find((b) => b.name === config.defaultBackend) ??
     config.backends[0]
@@ -85,18 +86,11 @@ export function loadConfig(configPath?: string): AdapterConfig {
     return { port: 3321, backends: [], defaultBackend: "", logLevel: "info" };
   }
 
-  let backends: BackendConfig[] = [];
-  let defaultBackend = "";
-
-  if (raw.backends?.length) {
-    backends = raw.backends.map((b, i) => parseBackend(b, i));
-    const explicit = raw.backends.findIndex((b) => b.default === true);
-    defaultBackend = backends[explicit >= 0 ? explicit : 0].name;
-  } else if (raw.backend) {
-    const b = parseBackend(raw.backend, 0);
-    backends = [b];
-    defaultBackend = b.name;
-  }
+  const backends = (raw.backends ?? []).map((b, i) => parseBackend(b, i));
+  const explicit = (raw.backends ?? []).findIndex((b) => b.default === true);
+  const defaultBackend = backends.length > 0
+    ? backends[explicit >= 0 ? explicit : 0].name
+    : "";
 
   return {
     port: raw.port ?? 3321,

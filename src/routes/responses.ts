@@ -53,7 +53,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     logger.error(`[R${rid}] No backend configured for model=${body.model}`);
     res.status(400).json({
       error: {
-        message: `No backend configured for model "${body.model}". Available: ${config.backends.map((b) => b.model).join(", ")}`,
+        message: `No backend configured for model "${body.model}". Available: ${config.backends.flatMap((b) => b.models).join(", ")}`,
         type: "invalid_request_error",
       },
     });
@@ -80,9 +80,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   logger.info(`[R${rid}] Transformed: ${chatReq.messages.length} messages, model=${chatReq.model}`);
   logger.debug(`[R${rid}] Full request`, JSON.stringify(chatReq));
 
-  const backendUrl =
-    backend.baseUrl.replace(/\/+$/, "") +
-    backend.completionsPath;
+  const backendUrl = backend.url;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
