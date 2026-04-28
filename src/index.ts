@@ -16,8 +16,8 @@ app.use(createModelsRouter(config));
 
 app.listen(config.port, () => {
   logger.info(`codex-adapter listening on http://localhost:${config.port}`);
-  logger.info(`Backend: ${config.backend.baseUrl}`);
-  if (config.backend.model) {
-    logger.info(`Default model: ${config.backend.model}`);
+  logger.info(`${config.backends.length} backend(s) configured, default: ${config.defaultBackend}`);
+  for (const b of config.backends) {
+    logger.info(`  [${b.name}] model=${b.model} url=${b.baseUrl}`);
   }
 });

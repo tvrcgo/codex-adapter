@@ -1,4 +1,4 @@
-import type { AdapterConfig } from "../config.js";
+import type { BackendConfig } from "../config.js";
 import type {
   ResponsesRequest,
   ResponsesInputItem,
@@ -13,14 +13,13 @@ import type {
   ChatToolCall,
 } from "./types.js";
 import { convertTools, convertToolChoice } from "./tools.js";
-import { logger } from "../utils/logger.js";
 
 export function transformRequest(
   body: ResponsesRequest,
-  config: AdapterConfig,
+  backend: BackendConfig,
 ): ChatCompletionsRequest {
-  let messages = buildMessages(body);
-  const model = config.backend.model ?? body.model;
+  const messages = buildMessages(body);
+  const model = backend.model ?? body.model;
 
   const req: ChatCompletionsRequest = {
     model,
@@ -55,8 +54,8 @@ export function transformRequest(
     }
   }
 
-  if (config.backend.extraBody) {
-    Object.assign(req, config.backend.extraBody);
+  if (backend.extraBody) {
+    Object.assign(req, backend.extraBody);
   }
 
   return req;

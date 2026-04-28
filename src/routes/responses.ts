@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
-import type { AdapterConfig } from "../config.js";
+import type { AdapterConfig, BackendConfig } from "../config.js";
+import { resolveBackend } from "../config.js";
 import type { ResponsesRequest, ChatCompletionChunk } from "../transform/types.js";
 import { transformRequest } from "../transform/request.js";
 import { ResponseStreamWriter } from "../transform/response-stream.js";
@@ -47,15 +48,27 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   const rid = ++reqCounter;
   const body = req.body as ResponsesRequest;
 
+  const backend = resolveBackend(config, body.model);
+  if (!backend) {
+    logger.error(`[R${rid}] No backend configured for model=${body.model}`);
+    res.status(400).json({
+      error: {
+        message: `No backend configured for model "${body.model}". Available: ${config.backends.map((b) => b.model).join(", ")}`,
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
   const inputSummary = typeof body.input === "string"
     ? `string(${body.input.length})`
     : `array(${Array.isArray(body.input) ? body.input.length : "?"} items)`;
 
-  logger.info(`[R${rid}] >>> model=${body.model} input=${inputSummary} tools=${body.tools?.length ?? 0}`);
+  logger.info(`[R${rid}] >>> model=${body.model} backend=${backend.name} input=${inputSummary} tools=${body.tools?.length ?? 0}`);
 
   let chatReq;
   try {
-    chatReq = transformRequest(body, config);
+    chatReq = transformRequest(body, backend);
   } catch (err) {
     logger.error(`[R${rid}] Transform failed`, err);
     res.status(400).json({
@@ -68,20 +81,20 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   logger.debug(`[R${rid}] Full request`, JSON.stringify(chatReq));
 
   const backendUrl =
-    config.backend.baseUrl.replace(/\/+$/, "") +
-    config.backend.completionsPath;
+    backend.baseUrl.replace(/\/+$/, "") +
+    backend.completionsPath;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "text/event-stream",
   };
 
-  if (config.backend.apiKey) {
-    headers["Authorization"] = `Bearer ${config.backend.apiKey}`;
+  if (backend.apiKey) {
+    headers["Authorization"] = `Bearer ${backend.apiKey}`;
   }
 
-  if (config.backend.extraHeaders) {
-    for (const [key, value] of Object.entries(config.backend.extraHeaders)) {
+  if (backend.extraHeaders) {
+    for (const [key, value] of Object.entries(backend.extraHeaders)) {
       headers[key] = encodeHeaderValue(value);
     }
   }
@@ -124,6 +137,72 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     return;
   }
 
+  // Buffer all SSE events first to detect empty responses before starting
+  // the client SSE stream. Empty responses must be returned as HTTP 400
+  // (context_length_exceeded) so Codex CLI triggers compaction instead of
+  // blind retries.
+  const allEvents: { data: string }[] = [];
+  const parsedChunks: ChatCompletionChunk[] = [];
+  let hasContent = false;
+
+  try {
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const { events, remaining } = parseSSEBuffer(buffer);
+      buffer = remaining;
+
+      for (const evt of events) {
+        const data = evt.data.trim();
+        allEvents.push({ data });
+        if (data === "[DONE]") continue;
+        try {
+          const chunk = JSON.parse(data) as ChatCompletionChunk;
+          parsedChunks.push(chunk);
+          if (chunk.choices?.length) {
+            for (const choice of chunk.choices) {
+              const d = choice.delta;
+              if (d && ((d.content != null && d.content !== "") || d.tool_calls?.length)) {
+                hasContent = true;
+              }
+            }
+          }
+        } catch {
+          // parse error, will be handled during replay
+        }
+      }
+    }
+  } catch (bufferErr: unknown) {
+    const errMsg = bufferErr instanceof Error ? bufferErr.message : String(bufferErr);
+    logger.error(`[R${rid}] Error buffering backend response: ${errMsg}`);
+    res.status(502).json({
+      error: { message: `Backend stream read failed: ${errMsg}`, type: "proxy_error" },
+    });
+    return;
+  }
+
+  logger.info(`[R${rid}] Buffered ${allEvents.length} SSE events, ${parsedChunks.length} chunks, hasContent=${hasContent}`);
+
+  if (!hasContent) {
+    const msgCount = chatReq.messages.length;
+    logger.warn(`[R${rid}] Backend returned empty response for ${msgCount} messages, returning 400`);
+    res.status(400).json({
+      error: {
+        message: `This model's maximum context length is ${backend.maxTokens ?? "unknown"} tokens. However, your messages resulted in too many tokens (${msgCount} messages). Please reduce the length of the messages.`,
+        type: "invalid_request_error",
+        param: "messages",
+        code: "context_length_exceeded",
+      },
+    });
+    return;
+  }
+
+  // Backend returned real content — replay buffered events as SSE
   req.socket.setTimeout(0);
   req.socket.setNoDelay(true);
 
@@ -136,59 +215,16 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   initSSE(res);
   const writer = new ResponseStreamWriter(res, chatReq.model);
 
-  let chunkCount = 0;
   let sseEventCount = 0;
+  for (const chunk of parsedChunks) {
+    sseEventCount++;
+    if (clientDisconnected) break;
+    writer.processChunk(chunk);
+  }
 
-  try {
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      if (clientDisconnected) {
-        logger.warn(`[R${rid}] Aborting: client gone after ${chunkCount} chunks`);
-        reader.cancel().catch(() => {});
-        break;
-      }
-
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      chunkCount++;
-      buffer += decoder.decode(value, { stream: true });
-      const { events, remaining } = parseSSEBuffer(buffer);
-      buffer = remaining;
-
-      for (const evt of events) {
-        sseEventCount++;
-        const data = evt.data.trim();
-        logger.info(`[R${rid}] SSE#${sseEventCount}: ${data.slice(0, 300)}`);
-        if (data === "[DONE]") continue;
-
-        try {
-          const chunk = JSON.parse(data) as ChatCompletionChunk;
-
-          if ((chunk as any).error) {
-            logger.error(`[R${rid}] Backend stream error`, data);
-          }
-
-          writer.processChunk(chunk);
-        } catch (parseErr) {
-          logger.warn(`[R${rid}] Parse failed: ${data.slice(0, 200)}`);
-        }
-      }
-    }
-
-    if (!clientDisconnected) {
-      writer.finalize();
-      logger.info(`[R${rid}] <<< Completed: ${chunkCount} chunks, ${sseEventCount} SSE events`);
-    }
-  } catch (streamErr: unknown) {
-    const errMsg = streamErr instanceof Error ? streamErr.message : String(streamErr);
-    logger.error(`[R${rid}] Stream error after ${chunkCount} chunks: ${errMsg}`);
-    if (!clientDisconnected) {
-      writer.emitError("Stream processing failed");
-    }
+  if (!clientDisconnected) {
+    writer.finalize();
+    logger.info(`[R${rid}] <<< Completed: ${parsedChunks.length} chunks, ${sseEventCount} SSE events`);
   }
 
   res.end();

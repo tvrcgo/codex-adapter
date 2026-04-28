@@ -4,31 +4,29 @@
 port: 3321
 log_level: info
 
-backend:
-  # 后端 API 基础地址（不含 /chat/completions 后缀）
-  base_url: http://localhost:8000/v1
-  # Chat Completions 路径后缀，拼接在 base_url 后面
-  completions_path: /chat/completions
-  # 后端 API Key
-  api_key: your-api-key
-  # 覆盖模型名（不设则透传 Codex 请求中的 model）
-  # model: your-model-name
-  # 上下文 token 上限，超出时截断旧消息，同时通过 /v1/models 暴露给客户端触发自动压缩
-  # max_tokens: 128000
+# 支持配置多个后端，通过请求中的 model 名称自动路由
+backends:
+  - name: my-backend           # 后端名称（用于日志和路由）
+    model: my-model             # 对应的 model 名称
+    default: true               # 标记为默认后端（未匹配时使用）
+    base_url: http://localhost:8000/v1
+    completions_path: /chat/completions
+    api_key: your-api-key
+    # max_tokens: 128000        # 上下文 token 上限
 
-  # 额外请求头
-  # extra_headers:
-  #   x-wps-uid: "xxx"
-  #   x-wps-name: "yyy"
+    # extra_headers:
+    #   x-custom-header: "value"
 
-  # 额外请求体字段（默认已注入下方配置，按需覆盖）
-  extra_body:
-    chat_template_kwargs:
-      enable_thinking: false
-    stream_options:
-      include_usage: true
+    extra_body:
+      stream_options:
+        include_usage: true
 
-# 对外公布的模型列表
-# models:
-#   - model-a
-#   - model-b
+  # - name: another-backend
+  #   model: another-model
+  #   base_url: https://api.example.com/v1
+  #   completions_path: /chat/completions
+  #   api_key: another-key
+  #   max_tokens: 64000
+  #   extra_body:
+  #     stream_options:
+  #       include_usage: true
