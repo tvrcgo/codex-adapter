@@ -9,7 +9,7 @@ export interface BackendConfig {
   apiKey: string;
   maxTokens?: number;
   extraHeaders?: Record<string, string>;
-  extraBody?: Record<string, unknown>;
+  extraBody?: Record<string, unknown> | null;  // null to disable default extraBody
 }
 
 export interface AdapterConfig {
@@ -32,7 +32,7 @@ interface RawBackend {
   api_key?: string;
   max_tokens?: number;
   extra_headers?: Record<string, string>;
-  extra_body?: Record<string, unknown>;
+  extra_body?: Record<string, unknown> | null;
 }
 
 interface RawConfig {
@@ -49,6 +49,17 @@ function parseModels(b: RawBackend, index: number): string[] {
 
 function parseBackend(b: RawBackend, index: number): BackendConfig {
   const models = parseModels(b, index);
+
+  // Handle extraBody: null disables default, empty object {} means no extras
+  let extraBody: Record<string, unknown> | null | undefined;
+  if (b.extra_body === null) {
+    extraBody = null;  // Explicitly disable extraBody
+  } else if (b.extra_body !== undefined) {
+    extraBody = b.extra_body;
+  } else {
+    extraBody = defaultExtraBody;  // Default behavior
+  }
+
   return {
     name: b.name ?? models[0],
     models,
@@ -56,7 +67,7 @@ function parseBackend(b: RawBackend, index: number): BackendConfig {
     apiKey: b.api_key ?? "",
     maxTokens: b.max_tokens,
     extraHeaders: b.extra_headers,
-    extraBody: b.extra_body ?? defaultExtraBody,
+    extraBody,
   };
 }
 

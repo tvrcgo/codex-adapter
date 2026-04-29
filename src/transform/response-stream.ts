@@ -26,10 +26,15 @@ interface ActiveToolCall {
 /**
  * Stateful transformer that receives Chat Completions chunks one at a time
  * and emits Responses API SSE events to the Express response.
+ *
+ * The `inputTokenOffset` ensures Codex sees conservative token counts:
+ *   reported input_tokens = real prompt_tokens + offset
+ * This triggers Codex's compaction earlier when approaching context limits.
  */
 export class ResponseStreamWriter {
   private res: Response;
   private model: string;
+  private inputTokenOffset: number;
 
   private responseId: string;
   private created: boolean = false;
@@ -44,12 +49,22 @@ export class ResponseStreamWriter {
   private activeToolCalls: Map<number, ActiveToolCall> = new Map();
   private nextOutputIndex: number = 0;
 
+  // XML tool call detection state
+  private xmlContentBuffer: string = "";
+  private xmlToolCallIndex: number = 1000;
+
   private usage: ResponseUsage | null = null;
 
-  constructor(res: Response, model: string) {
+  constructor(res: Response, model: string, inputTokenOffset: number = 0) {
     this.res = res;
     this.model = model;
+    this.inputTokenOffset = inputTokenOffset;
     this.responseId = genResponseId();
+  }
+
+  /** Update the token offset (can be called after backend responds with real prompt_tokens). */
+  setInputTokenOffset(offset: number): void {
+    this.inputTokenOffset = offset;
   }
 
   /** Process a single parsed Chat Completions chunk. */
@@ -74,7 +89,7 @@ export class ResponseStreamWriter {
       if (!delta) continue;
 
       if (delta.content != null && delta.content !== "") {
-        this.handleTextDelta(delta.content);
+        this.handleContentDelta(delta.content);
       }
 
       if (delta.tool_calls) {
@@ -86,15 +101,36 @@ export class ResponseStreamWriter {
   }
 
   /** Call after the upstream stream ends ([DONE]) to emit closing events. */
-  finalize(): void {
+  finalize(hasContent: boolean = true): void {
+    // Flush any remaining XML buffer as text
+    if (this.xmlContentBuffer) {
+      const toFlush = this.xmlContentBuffer;
+      this.xmlContentBuffer = "";
+      this.handleTextDelta(toFlush);
+    }
+
     this.closeTextMessage();
     this.closeAllToolCalls();
 
     const outputItems = this.buildOutputItems();
 
-    if (outputItems.length === 0) {
-      logger.warn("[finalize] Empty response from backend, emitting error");
-      this.emitError("Backend returned empty response — the conversation may be too long or contain unsupported content. Try compacting the context.");
+    // If no content, synthesize an empty output so Codex receives a valid completed event
+    if (outputItems.length === 0 || !hasContent) {
+      const emptyMsgId = genMessageId();
+      const emptyItem: ResponseMessageItem = {
+        id: emptyMsgId,
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "", annotations: [] }],
+      };
+
+      const response = this.buildResponseObject("completed", [emptyItem]);
+      logger.debug(`[finalize] Empty response from backend, synthesized completed event`);
+      sendEvent(this.res, "response.completed", {
+        type: "response.completed",
+        response,
+      });
       return;
     }
 
@@ -123,6 +159,194 @@ export class ResponseStreamWriter {
       type: "response.failed",
       response,
     });
+  }
+
+  // ─── Content delta with XML tool call detection ───
+
+  /**
+   * Handle content delta: detect XML-style tool calls from backends
+   * that output tool calls as text (e.g., GLM-5/WPS) and convert them
+   * to proper function_call events.
+   * Also filters out thinking content (e.g., <millennia-thinking> tags).
+   */
+  private handleContentDelta(content: string): void {
+    this.xmlContentBuffer += content;
+
+    // First, strip out any thinking content (millennia-thinking tags from GLM-5)
+    this.xmlContentBuffer = this.stripThinkingContent(this.xmlContentBuffer);
+
+    // Try to extract complete XML tool calls from the buffer
+    const extracted = this.extractXmlToolCalls(this.xmlContentBuffer);
+    if (extracted) {
+      const { calls, remaining, textBefore } = extracted;
+      this.xmlContentBuffer = remaining;
+
+      // Emit any text before the XML tags as regular text
+      if (textBefore) {
+        this.handleTextDelta(textBefore);
+      }
+
+      for (const call of calls) {
+        this.emitXmlToolCall(call);
+      }
+      return;
+    }
+
+    // Check if we're potentially in the middle of an XML tool call
+    if (this.isPartialXmlToolCall(this.xmlContentBuffer)) {
+      // Don't emit yet - wait for more content to complete the pattern
+      return;
+    }
+
+    // Not an XML tool call - flush buffer as regular text
+    if (this.xmlContentBuffer) {
+      const toFlush = this.xmlContentBuffer;
+      this.xmlContentBuffer = "";
+      this.handleTextDelta(toFlush);
+    }
+  }
+
+  /**
+   * Strip thinking content from GLM-5/WPS backend.
+   * The <millennia-thinking>...</millennia-thinking> tags contain internal reasoning
+   * that should not be shown to the user.
+   */
+  private stripThinkingContent(content: string): string {
+    // Remove complete thinking blocks
+    return content.replace(/<millennia-thinking>[\s\S]*?<\/millennia-thinking>/gi, "");
+  }
+
+  /** Emit a single XML-detected tool call as a complete function_call event sequence. */
+  private emitXmlToolCall(call: { name: string; arguments: Record<string, unknown> }): void {
+    const tcIndex = this.xmlToolCallIndex++;
+    const callId = genCallId();
+    const itemId = genItemId();
+    const outputIndex = this.nextOutputIndex++;
+    const argsStr = JSON.stringify(call.arguments);
+
+    // Emit output_item.added with function_call header
+    const item: ResponseFunctionCallItem = {
+      id: itemId,
+      type: "function_call",
+      call_id: callId,
+      name: call.name,
+      arguments: "",
+      status: "in_progress",
+    };
+
+    sendEvent(this.res, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item,
+    });
+
+    // Emit arguments delta
+    sendEvent(this.res, "response.function_call_arguments.delta", {
+      type: "response.function_call_arguments.delta",
+      item_id: itemId,
+      output_index: outputIndex,
+      call_id: callId,
+      delta: argsStr,
+    });
+
+    // Track as active tool call for finalize/closeAllToolCalls
+    this.activeToolCalls.set(tcIndex, {
+      index: tcIndex,
+      itemId,
+      callId,
+      name: call.name,
+      arguments: argsStr,
+      outputIndex,
+      headerEmitted: true,
+    });
+
+    logger.info(`[XML->function_call] name=${call.name} args=${argsStr.slice(0, 100)}`);
+  }
+
+  /** Extract complete XML tool calls from content. Returns null if no complete pattern found. */
+  private extractXmlToolCalls(content: string): {
+    calls: Array<{ name: string; arguments: Record<string, unknown> }>;
+    remaining: string;
+    textBefore: string;
+  } | null {
+    const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+
+    // Pattern 1: <command>JSON array</command> (GLM-5/WPS format)
+    // e.g. <command>["powershell.exe", "-Command", "rg -n 'dir=' D:\\Code\\wpsweb --type html"]</command>
+    const commandTagRegex = /<command>\s*([\s\S]*?)\s*<\/command>/g;
+    let match: RegExpExecArray | null;
+    let firstMatchStart = -1;
+    let lastMatchEnd = 0;
+
+    while ((match = commandTagRegex.exec(content)) !== null) {
+      if (firstMatchStart === -1) firstMatchStart = match.index;
+      lastMatchEnd = match.index + match[0].length;
+
+      const inner = match[1].trim();
+      try {
+        const parsed = JSON.parse(inner);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const cmd = String(parsed[0]);
+          const args = parsed.slice(1).map((a: unknown) => String(a));
+          calls.push({
+            name: "shell",
+            arguments: { command: cmd, args },
+          });
+        } else {
+          calls.push({ name: "shell", arguments: { command: inner } });
+        }
+      } catch {
+        calls.push({ name: "shell", arguments: { command: inner } });
+      }
+    }
+
+    // Pattern 2: <execute>command</execute>
+    if (calls.length === 0) {
+      const executeTagRegex = /<execute>\s*([\s\S]*?)\s*<\/execute>/g;
+      while ((match = executeTagRegex.exec(content)) !== null) {
+        if (firstMatchStart === -1) firstMatchStart = match.index;
+        lastMatchEnd = match.index + match[0].length;
+
+        calls.push({
+          name: "shell",
+          arguments: { command: match[1].trim() },
+        });
+      }
+    }
+
+    if (calls.length === 0) return null;
+
+    const textBefore = firstMatchStart > 0 ? content.slice(0, firstMatchStart) : "";
+    const remaining = lastMatchEnd < content.length ? content.slice(lastMatchEnd) : "";
+
+    return { calls, remaining, textBefore };
+  }
+
+  /** Check if content might be the start of an incomplete XML tool call pattern. */
+  private isPartialXmlToolCall(content: string): boolean {
+    const trimmed = content.trimEnd();
+    if (!trimmed) return false;
+
+    // Incomplete thinking tag - buffer to hide thinking content
+    if (/<millennia-thinking[^>]*$/i.test(trimmed)) return true;
+    if (/<millennia-thinking[^>]*>/i.test(trimmed) && !/<\/millennia-thinking>/i.test(trimmed)) return true;
+
+    // Incomplete opening tag
+    if (/<[a-z]*$/.test(trimmed)) return true;
+    if (/<command[^>]*$/.test(trimmed)) return true;
+    if (/<execute[^>]*$/.test(trimmed)) return true;
+
+    // Opened tag but not yet closed
+    const openCmd = trimmed.match(/<command[^>]*>/);
+    if (openCmd && !trimmed.includes("</command>")) return true;
+
+    const openExec = trimmed.match(/<execute[^>]*>/);
+    if (openExec && !trimmed.includes("</execute>")) return true;
+
+    // Don't buffer too long without finding a pattern
+    if (trimmed.length > 500) return false;
+
+    return false;
   }
 
   // ─── Text handling ───
@@ -311,6 +535,15 @@ export class ResponseStreamWriter {
     status: ResponseObject["status"],
     output: ResponseOutputItem[],
   ): ResponseObject {
+    const baseUsage = this.usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+
+    // Apply inputTokenOffset so Codex sees conservative token counts
+    const usage: ResponseUsage = {
+      input_tokens: baseUsage.input_tokens + this.inputTokenOffset,
+      output_tokens: baseUsage.output_tokens,
+      total_tokens: baseUsage.total_tokens + this.inputTokenOffset,
+    };
+
     return {
       id: this.responseId,
       object: "response",
@@ -318,7 +551,7 @@ export class ResponseStreamWriter {
       model: this.model,
       status,
       output,
-      usage: this.usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      usage,
     };
   }
 

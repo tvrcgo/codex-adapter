@@ -11,6 +11,7 @@ import type {
   ChatUserContentPart,
   ChatAssistantMessage,
   ChatToolCall,
+  ChatTool,
 } from "./types.js";
 import { convertTools, convertToolChoice } from "./tools.js";
 
@@ -18,7 +19,8 @@ export function transformRequest(
   body: ResponsesRequest,
   backend: BackendConfig,
 ): ChatCompletionsRequest {
-  const messages = buildMessages(body);
+  let messages = buildMessages(body);
+  messages = validateMessageSequence(messages);
 
   const req: ChatCompletionsRequest = {
     model: body.model,
@@ -56,6 +58,8 @@ export function transformRequest(
   if (backend.extraBody) {
     Object.assign(req, backend.extraBody);
   }
+  // Note: backend.extraBody === null means explicitly disable extraBody
+  // backend.extraBody === undefined should not happen (config sets default)
 
   return req;
 }
@@ -132,6 +136,41 @@ function mergeSystemMessages(messages: ChatMessage[]): ChatMessage[] {
   return [{ role: "system", content: systemParts.join("\n\n") }, ...rest];
 }
 
+/**
+ * Validate and clean message sequence for Chat Completions API compatibility.
+ * - Remove orphaned tool messages (no matching preceding tool_call_id)
+ * - Deduplicate duplicate tool_call_id in tool messages
+ */
+function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
+  // First pass: collect all tool_call_ids from assistant messages
+  const allCallIds = new Set<string>();
+  for (const msg of messages) {
+    if (msg.role === "assistant" && "tool_calls" in msg && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        allCallIds.add(tc.id);
+      }
+    }
+  }
+
+  // Second pass: track seen tool_call_ids and filter orphaned/duplicate tool messages
+  const seenCallIds = new Set<string>();
+  const result: ChatMessage[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === "tool" && "tool_call_id" in msg) {
+      const callId = msg.tool_call_id;
+      // Skip orphaned tool message (no matching call_id in history)
+      if (!allCallIds.has(callId)) continue;
+      // Skip duplicate tool_call_id
+      if (seenCallIds.has(callId)) continue;
+      seenCallIds.add(callId);
+    }
+    result.push(msg);
+  }
+
+  return result;
+}
+
 function convertInputItem(item: ResponsesInputItem): ChatMessage | null {
   if (isFunctionCallOutputItem(item)) {
     return {
@@ -159,8 +198,9 @@ function convertInputItem(item: ResponsesInputItem): ChatMessage | null {
   }
 
   const parts = convertUserContentParts(msgItem.content);
-  if (parts.length === 1 && parts[0].type === "text") {
-    return { role: "user", content: parts[0].text };
+  // If all parts are plain text, merge them into a string (WPS/GLM doesn't support array content)
+  if (parts.every((p) => p.type === "text")) {
+    return { role: "user", content: parts.map((p) => p.text).join("") };
   }
   return { role: "user", content: parts };
 }
@@ -211,75 +251,160 @@ function isFunctionCallOutputItem(item: ResponsesInputItem): item is ResponsesFu
   return (item as ResponsesFunctionCallOutputItem).type === "function_call_output";
 }
 
-// --- Context truncation ---
+// --- Token estimation constants ---
+// Conservative chars-per-token ratios; err toward overestimation.
 
-function estimateTokens(messages: ChatMessage[]): number {
-  let chars = 0;
-  for (const msg of messages) {
-    chars += 4; // role overhead
-    if (typeof msg.content === "string") {
-      chars += msg.content.length;
-    } else if (Array.isArray(msg.content)) {
-      chars += JSON.stringify(msg.content).length;
-    }
-    if ("tool_calls" in msg && msg.tool_calls) {
-      chars += JSON.stringify(msg.tool_calls).length;
-    }
+const CHARS_PER_TOKEN_TEXT = 3.0;   // Natural language content
+const CHARS_PER_TOKEN_JSON = 2.0;   // JSON / structured content (tool_calls, content parts)
+const CHARS_PER_TOKEN_TOOLS = 1.8;  // Tool schemas (densest JSON with short keys)
+
+const PER_MESSAGE_TOKENS = 6;       // Chat template boundary tokens per message
+const PER_TOOL_CALL_ID_TOKENS = 4;  // tool_call_id field on tool-role messages
+
+// --- Tool message compression ---
+// When estimated tokens approach the context limit, compress old tool exchanges
+// into compact text while keeping recent ones intact.
+
+const KEEP_RECENT_TOOL_ROUNDS = 4;
+const TOOL_RESULT_MAX_CHARS = 300;
+
+/**
+ * Compress old tool rounds when estimated tokens exceed threshold.
+ * @param maxTokens Backend context token limit. If unset, defaults to 128000.
+ */
+export function compressToolMessages(
+  chatReq: ChatCompletionsRequest,
+  maxTokens?: number,
+): { compressed: boolean; rounds: number } {
+  const limit = maxTokens ?? 128000;
+  const threshold = Math.floor(limit * 0.75);
+
+  const currentEst = estimateTokens(chatReq.messages) + estimateToolTokens(chatReq.tools);
+  if (currentEst <= threshold) return { compressed: false, rounds: 0 };
+
+  let compressedCount = 0;
+
+  while (true) {
+    const rounds = identifyToolRounds(chatReq.messages);
+    if (rounds.length <= KEEP_RECENT_TOOL_ROUNDS) break;
+
+    compressRound(chatReq.messages, rounds[0]);
+    compressedCount++;
+
+    if (estimateTokens(chatReq.messages) + estimateToolTokens(chatReq.tools) <= threshold) break;
   }
-  // ~3.5 chars per token on average (mixed English/Chinese/JSON)
-  return Math.ceil(chars / 3.5);
+
+  return { compressed: compressedCount > 0, rounds: compressedCount };
 }
 
-interface TruncateResult {
-  messages: ChatMessage[];
-  dropped: number;
-  beforeTokens: number;
-  afterTokens: number;
+interface ToolRound {
+  assistantIdx: number;
+  toolIndices: number[];
 }
 
-function truncateMessages(messages: ChatMessage[], maxTokens: number): TruncateResult {
-  const beforeTokens = estimateTokens(messages);
-  if (beforeTokens <= maxTokens) {
-    return { messages, dropped: 0, beforeTokens, afterTokens: beforeTokens };
+function identifyToolRounds(messages: ChatMessage[]): ToolRound[] {
+  const rounds: ToolRound[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role !== "assistant" || !("tool_calls" in msg) || !msg.tool_calls?.length) continue;
+
+    const callIds = new Set(msg.tool_calls.map(tc => tc.id));
+    const toolIndices: number[] = [];
+
+    for (let j = i + 1; j < messages.length; j++) {
+      const next = messages[j];
+      if (next.role === "tool" && "tool_call_id" in next && callIds.has(next.tool_call_id)) {
+        toolIndices.push(j);
+      } else if (next.role !== "tool") {
+        break;
+      }
+    }
+
+    if (toolIndices.length > 0) {
+      rounds.push({ assistantIdx: i, toolIndices });
+    }
   }
 
-  // Split into: system (head) + conversation (middle + tail)
-  let systemEnd = 0;
-  while (systemEnd < messages.length && messages[systemEnd].role === "system") {
-    systemEnd++;
-  }
-  const systemMsgs = messages.slice(0, systemEnd);
-  const convMsgs = messages.slice(systemEnd);
+  return rounds;
+}
 
-  // Keep removing oldest conversation messages until under limit.
-  // Respect tool call pairing: if an assistant message with tool_calls is kept,
-  // its corresponding tool results must also be kept.
-  const systemTokens = estimateTokens(systemMsgs);
-  const budget = maxTokens - systemTokens;
+function compressRound(messages: ChatMessage[], round: ToolRound): void {
+  const assistantMsg = messages[round.assistantIdx] as ChatAssistantMessage;
+  const toolCalls = assistantMsg.tool_calls!;
 
-  // Build from the tail (most recent messages first)
-  const kept: ChatMessage[] = [];
-  let keptTokens = 0;
-  for (let i = convMsgs.length - 1; i >= 0; i--) {
-    const msgTokens = estimateTokens([convMsgs[i]]);
-    if (keptTokens + msgTokens > budget) break;
-    kept.unshift(convMsgs[i]);
-    keptTokens += msgTokens;
+  // Build compact text representation
+  const parts: string[] = [];
+  if (assistantMsg.content) parts.push(assistantMsg.content);
+
+  for (const tc of toolCalls) {
+    const args = tc.function.arguments;
+    const argsSummary = args.length > 100 ? args.slice(0, 100) + "..." : args;
+    parts.push(`[Called ${tc.function.name}(${argsSummary})]`);
   }
 
-  // Ensure tool_call pairing: if the first kept message is role=tool,
-  // we need its preceding assistant message. Drop orphan tool messages from front.
-  while (kept.length > 0 && kept[0].role === "tool") {
-    keptTokens -= estimateTokens([kept[0]]);
-    kept.shift();
+  // Merge tool results into the text
+  for (const idx of round.toolIndices) {
+    const toolMsg = messages[idx] as { role: "tool"; tool_call_id: string; content: string };
+    const matchingCall = toolCalls.find(tc => tc.id === toolMsg.tool_call_id);
+    const name = matchingCall?.function.name ?? "tool";
+
+    const content = toolMsg.content;
+    if (content.length > TOOL_RESULT_MAX_CHARS) {
+      parts.push(`[${name} result (${content.length} chars): ${content.slice(0, TOOL_RESULT_MAX_CHARS)}...]`);
+    } else {
+      parts.push(`[${name} result: ${content}]`);
+    }
   }
 
-  const dropped = convMsgs.length - kept.length;
-  const result = [...systemMsgs, ...kept];
-  return {
-    messages: result,
-    dropped,
-    beforeTokens,
-    afterTokens: estimateTokens(result),
+  // Replace assistant message: remove tool_calls, set content to compact text
+  (messages[round.assistantIdx] as ChatAssistantMessage) = {
+    role: "assistant",
+    content: parts.join("\n"),
   };
+
+  // Remove tool result messages (iterate in reverse to preserve indices)
+  const sortedIndices = [...round.toolIndices].sort((a, b) => b - a);
+  for (const idx of sortedIndices) {
+    messages.splice(idx, 1);
+  }
+}
+
+// --- Token estimation ---
+
+export function estimateTokens(messages: ChatMessage[]): number {
+  let tokens = 0;
+  for (const msg of messages) {
+    tokens += PER_MESSAGE_TOKENS;
+
+    if (typeof msg.content === "string") {
+      tokens += Math.ceil(msg.content.length / CHARS_PER_TOKEN_TEXT);
+    } else if (Array.isArray(msg.content)) {
+      tokens += Math.ceil(JSON.stringify(msg.content).length / CHARS_PER_TOKEN_JSON);
+    }
+
+    if ("tool_calls" in msg && msg.tool_calls) {
+      tokens += Math.ceil(JSON.stringify(msg.tool_calls).length / CHARS_PER_TOKEN_JSON);
+    }
+
+    if ("tool_call_id" in msg) {
+      tokens += PER_TOOL_CALL_ID_TOKENS;
+    }
+  }
+  return tokens;
+}
+
+export function estimateToolTokens(tools: ChatTool[] | undefined): number {
+  if (!tools?.length) return 0;
+
+  const toolsJsonLen = JSON.stringify(tools).length;
+  let tokens = Math.ceil(toolsJsonLen / CHARS_PER_TOKEN_TOOLS);
+
+  // Per-tool chat template formatting overhead
+  tokens += tools.length * 8;
+
+  // System prompt overhead for tool definitions
+  tokens += 40;
+
+  return tokens;
 }

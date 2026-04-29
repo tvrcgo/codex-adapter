@@ -6,3 +6,4 @@ test/
 .env
 config.yml
 !config.example.yml
+package-lock.json

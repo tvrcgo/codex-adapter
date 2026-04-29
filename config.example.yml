@@ -19,6 +19,9 @@ backends:
     extra_body:
       stream_options:
         include_usage: true
+      # chat_template_kwargs:        # WPS/GLM 后端需要
+      #   enable_thinking: false
+      # 注意：如果后端返回 param_wrong 错误，尝试设置 extra_body: null 禁用默认值
 
   # - name: another-backend
   #   model: another-model
