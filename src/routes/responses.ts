@@ -100,8 +100,8 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   const rid = ++reqCounter;
   const body = req.body as ResponsesRequest;
 
-  // Log the RAW request body for debugging param_wrong issues
-  logger.info(`[R${rid}] RAW request body: ${JSON.stringify(body).slice(0, 5000)}`);
+  // Log request body for debugging
+  logger.debug(`[R${rid}] RAW request body: ${JSON.stringify(body).slice(0, 5000)}`);
 
   const backend = resolveBackend(config, body.model);
   if (!backend) {
@@ -466,6 +466,14 @@ async function fetchAndBufferUntilContent(
             const d = choice.delta;
             if (d && ((d.content != null && d.content !== "") || d.tool_calls?.length)) {
               hasContent = true;
+              // Log tool calls from backend
+              if (d.tool_calls?.length) {
+                logger.debug(`[R${rid}] Backend tool_calls: ${JSON.stringify(d.tool_calls).slice(0, 200)}`);
+              }
+              // Log content delta for debugging XML tool detection
+              if (d.content && (d.content.includes('<command') || d.content.includes('<execute'))) {
+                logger.debug(`[R${rid}] Backend content with XML tool: ${d.content.slice(0, 300)}`);
+              }
             }
           }
         }

@@ -106,6 +106,7 @@ export class ResponseStreamWriter {
     if (this.xmlContentBuffer) {
       const toFlush = this.xmlContentBuffer;
       this.xmlContentBuffer = "";
+      logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
       this.handleTextDelta(toFlush);
     }
 
@@ -113,6 +114,12 @@ export class ResponseStreamWriter {
     this.closeAllToolCalls();
 
     const outputItems = this.buildOutputItems();
+
+    // Log if text-only response (no tool calls)
+    const hasToolCalls = this.activeToolCalls.size > 0;
+    if (this.textContent && !hasToolCalls) {
+      logger.debug(`[finalize] Text-only response (${this.textContent.length} chars): ${this.textContent.slice(0, 500)}`);
+    }
 
     // If no content, synthesize an empty output so Codex receives a valid completed event
     if (outputItems.length === 0 || !hasContent) {
@@ -171,6 +178,7 @@ export class ResponseStreamWriter {
    */
   private handleContentDelta(content: string): void {
     this.xmlContentBuffer += content;
+    const bufLen = this.xmlContentBuffer.length;
 
     // First, strip out any thinking content (millennia-thinking tags from GLM-5)
     this.xmlContentBuffer = this.stripThinkingContent(this.xmlContentBuffer);
@@ -195,6 +203,9 @@ export class ResponseStreamWriter {
     // Check if we're potentially in the middle of an XML tool call
     if (this.isPartialXmlToolCall(this.xmlContentBuffer)) {
       // Don't emit yet - wait for more content to complete the pattern
+      if (bufLen > 100) {
+        logger.debug(`[handleContentDelta] Buffering ${bufLen} chars for partial XML: ${this.xmlContentBuffer.slice(-100)}`);
+      }
       return;
     }
 
@@ -433,12 +444,17 @@ export class ResponseStreamWriter {
   private handleToolCallDelta(tc: ChatChunkToolCall): void {
     let active = this.activeToolCalls.get(tc.index);
 
-    if (!active && tc.id) {
+    // Create active tool call if we have either id or function.name
+    // (some backends send name before id, or omit id entirely)
+    if (!active && (tc.id || tc.function?.name)) {
+      const callId = tc.id ?? genCallId();
+      const name = tc.function?.name ?? "";
+      logger.info(`[handleToolCallDelta] New tool call: index=${tc.index} id=${callId} name=${name}`);
       active = {
         index: tc.index,
         itemId: genItemId(),
-        callId: tc.id,
-        name: tc.function?.name ?? "",
+        callId,
+        name,
         arguments: "",
         outputIndex: this.nextOutputIndex++,
         headerEmitted: false,
@@ -449,6 +465,11 @@ export class ResponseStreamWriter {
     if (!active) {
       logger.warn("Tool call delta without prior header, index=" + tc.index);
       return;
+    }
+
+    // Update id if it arrives in a later delta
+    if (tc.id && active.callId !== tc.id) {
+      active.callId = tc.id;
     }
 
     if (tc.function?.name && !active.headerEmitted) {
