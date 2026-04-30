@@ -12,6 +12,7 @@ import type {
 import { sendEvent } from "../utils/sse.js";
 import { genResponseId, genMessageId, genItemId, genCallId } from "../utils/id.js";
 import { logger } from "../utils/logger.js";
+import { cacheReasoning, makeReasoningKey } from "../utils/reasoning-cache.js";
 
 interface ActiveToolCall {
   index: number;
@@ -43,6 +44,7 @@ export class ResponseStreamWriter {
   private messageItemId: string | null = null;
   private messageOutputIndex: number = -1;
   private textContent: string = "";
+  private reasoningContent: string = "";
   private textPartEmitted: boolean = false;
 
   // Tool call state
@@ -88,6 +90,10 @@ export class ResponseStreamWriter {
       const delta = choice.delta;
       if (!delta) continue;
 
+      if (delta.reasoning_content != null && delta.reasoning_content !== "") {
+        this.reasoningContent += delta.reasoning_content;
+      }
+
       if (delta.content != null && delta.content !== "") {
         this.handleContentDelta(delta.content);
       }
@@ -108,6 +114,13 @@ export class ResponseStreamWriter {
       this.xmlContentBuffer = "";
       logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
       this.handleTextDelta(toFlush);
+    }
+
+    // Cache reasoning content for reuse
+    if (this.reasoningContent) {
+      const toolCallIds = Array.from(this.activeToolCalls.values()).map(tc => tc.callId);
+      const key = makeReasoningKey(this.textContent, toolCallIds);
+      cacheReasoning(key, this.reasoningContent);
     }
 
     this.closeTextMessage();

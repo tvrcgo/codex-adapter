@@ -10,6 +10,7 @@ export interface BackendConfig {
   maxTokens?: number;
   extraHeaders?: Record<string, string>;
   extraBody?: Record<string, unknown> | null;  // null to disable default extraBody
+  stripParams?: string[];
 }
 
 export interface AdapterConfig {
@@ -33,6 +34,7 @@ interface RawBackend {
   max_tokens?: number;
   extra_headers?: Record<string, string>;
   extra_body?: Record<string, unknown> | null;
+  strip_params?: string[];
 }
 
 interface RawConfig {
@@ -68,6 +70,7 @@ function parseBackend(b: RawBackend, index: number): BackendConfig {
     maxTokens: b.max_tokens,
     extraHeaders: b.extra_headers,
     extraBody,
+    stripParams: b.strip_params,
   };
 }
 

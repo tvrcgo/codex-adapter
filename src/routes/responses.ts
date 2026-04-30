@@ -170,7 +170,6 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     `messages=${chatReq.messages.length} tools=${chatReq.tools?.length ?? 0} ` +
     `max_tokens=${chatReq.max_tokens ?? "unset"} model=${chatReq.model}`
   );
-  // Log the full request body for debugging param_wrong errors
   logger.debug(`[R${rid}] Full request body: ${reqBodyStr}`);
 
   // --- Build headers for backend ---
@@ -460,11 +459,11 @@ async function fetchAndBufferUntilContent(
 
         bufferedChunks.push(chunk);
 
-        // Check for actual content
+        // Check for actual content (including reasoning_content from master)
         if (chunk.choices?.length) {
           for (const choice of chunk.choices) {
             const d = choice.delta;
-            if (d && ((d.content != null && d.content !== "") || d.tool_calls?.length)) {
+            if (d && ((d.content != null && d.content !== "") || (d.reasoning_content != null && d.reasoning_content !== "") || d.tool_calls?.length)) {
               hasContent = true;
               // Log tool calls from backend
               if (d.tool_calls?.length) {

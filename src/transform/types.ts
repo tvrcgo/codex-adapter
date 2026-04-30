@@ -152,6 +152,7 @@ export type ChatUserContentPart =
 export interface ChatAssistantMessage {
   role: "assistant";
   content?: string | null;
+  reasoning_content?: string | null;
   tool_calls?: ChatToolCall[];
 }
 
@@ -201,6 +202,7 @@ export interface ChatChunkChoice {
 export interface ChatChunkDelta {
   role?: "assistant";
   content?: string | null;
+  reasoning_content?: string | null;
   tool_calls?: ChatChunkToolCall[];
 }
 
