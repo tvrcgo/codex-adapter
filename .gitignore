@@ -7,3 +7,4 @@ test/
 config.yml
 !config.example.yml
 package-lock.json
+settings.local.json

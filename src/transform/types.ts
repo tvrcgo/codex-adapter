@@ -52,8 +52,8 @@ export interface ResponsesFunctionCallOutputItem {
 }
 
 export interface ResponsesTool {
-  type: "function";
-  name: string;
+  type: "function" | "apply_patch" | "web_search_preview" | "code_edit" | string;
+  name?: string;  // Optional for built-in tools that use type as name
   description?: string;
   parameters?: Record<string, unknown>;
   strict?: boolean;

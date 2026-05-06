@@ -35,8 +35,14 @@ export function transformRequest(
   const tools = convertTools(body.tools);
   if (tools) {
     req.tools = tools;
-    const toolChoice = convertToolChoice(body.tool_choice);
-    if (toolChoice) req.tool_choice = toolChoice;
+
+    // Handle tool_choice: backend config can force "required" to prevent text-only responses
+    if (backend.forceToolChoice) {
+      req.tool_choice = "required";
+    } else {
+      const toolChoice = convertToolChoice(body.tool_choice);
+      if (toolChoice) req.tool_choice = toolChoice;
+    }
   }
 
   if (body.text?.format) {

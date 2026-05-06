@@ -10,6 +10,8 @@ export interface BackendConfig {
   maxTokens?: number;
   extraHeaders?: Record<string, string>;
   extraBody?: Record<string, unknown> | null;  // null to disable default extraBody
+  /** When true and request has tools, force tool_choice="required" to prevent text-only responses */
+  forceToolChoice?: boolean;
 }
 
 export interface AdapterConfig {
@@ -33,6 +35,7 @@ interface RawBackend {
   max_tokens?: number;
   extra_headers?: Record<string, string>;
   extra_body?: Record<string, unknown> | null;
+  force_tool_choice?: boolean;
 }
 
 interface RawConfig {
@@ -68,6 +71,7 @@ function parseBackend(b: RawBackend, index: number): BackendConfig {
     maxTokens: b.max_tokens,
     extraHeaders: b.extra_headers,
     extraBody,
+    forceToolChoice: b.force_tool_choice,
   };
 }
 

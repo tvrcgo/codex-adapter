@@ -250,23 +250,20 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   }
 
   if (lastAttempt.kind === "error") {
+    // Always return SSE format for errors so Codex CLI can handle them properly
+    initSSE(res);
+    const writer = new ResponseStreamWriter(res, chatReq.model, 0);
+
     if (lastAttempt.contextExceeded) {
       // context_length_exceeded
-      res.status(400).json({
-        error: {
-          message: `This model's maximum context length is ${backend.maxTokens ?? "unknown"} tokens. ` +
-            `Your messages resulted in too many tokens. ` +
-            `Please reduce the length of the messages.`,
-          type: "invalid_request_error",
-          param: "messages",
-          code: "context_length_exceeded",
-        },
-      });
-      return;
+      writer.emitError(
+        `This model's maximum context length is ${backend.maxTokens ?? "unknown"} tokens. ` +
+        `Your messages resulted in too many tokens. Please reduce the length of the messages.`
+      );
+    } else {
+      writer.emitError(lastAttempt.message);
     }
-    res.status(lastAttempt.status ?? 502).json({
-      error: { message: lastAttempt.message, type: "upstream_error" },
-    });
+    res.end();
     return;
   }
 
@@ -280,6 +277,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     return;
   }
 
+  
   // --- Success: replay buffered chunks and stream remaining ---
 
   const { bufferedChunks, stream } = lastAttempt;
@@ -290,6 +288,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   // Will be updated once we see real prompt_tokens from the backend.
   const initialOffset = Math.max(0, calibratedEst - adapterTotalEst);
   const writer = new ResponseStreamWriter(res, chatReq.model, initialOffset);
+  logger.debug(`[R${rid}] Writer created, bufferedChunks=${bufferedChunks.length}`);
 
   // Heartbeat timer for keepalive
   let heartbeatTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
@@ -304,6 +303,20 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   // Helper to process a single chunk and extract prompt_tokens for calibration
   function processAndCalibrate(chunk: ChatCompletionChunk): void {
     sseEventCount++;
+    // Debug: log chunks with tool_calls
+    if (chunk.choices?.some(c => c.delta?.tool_calls?.length)) {
+      logger.debug(`[R${rid}] processAndCalibrate: chunk with tool_calls, count=${sseEventCount}`);
+    }
+    // Debug: log chunks with content (first 50 chars)
+    const contentDelta = chunk.choices?.[0]?.delta?.content;
+    if (contentDelta != null && contentDelta !== "") {
+      logger.debug(`[R${rid}] processAndCalibrate: chunk with content (${contentDelta.length} chars), count=${sseEventCount}, preview="${contentDelta.slice(0, 50)}"`);
+    }
+    // Log finish_reason for debugging
+    const finishReason = chunk.choices?.[0]?.finish_reason;
+    if (finishReason) {
+      logger.info(`[R${rid}] processAndCalibrate: finish_reason=${finishReason}, count=${sseEventCount}`);
+    }
     writer.processChunk(chunk);
 
     // Extract real prompt_tokens when available (usually in the final chunk with usage)
@@ -323,10 +336,15 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let streamIteration = 0;
 
     while (!clientDisconnected) {
       const { done, value } = await reader.read();
-      if (done) break;
+      streamIteration++;
+      if (done) {
+        logger.info(`[R${rid}] Stream reader done after ${streamIteration} iterations`);
+        break;
+      }
 
       buffer += decoder.decode(value, { stream: true });
       const { events, remaining } = parseSSEBuffer(buffer);
@@ -334,7 +352,10 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
 
       for (const evt of events) {
         const data = evt.data.trim();
-        if (data === "[DONE]") continue;
+        if (data === "[DONE]") {
+          logger.info(`[R${rid}] Received [DONE] marker from backend`);
+          continue;
+        }
 
         let chunk: ChatCompletionChunk;
         try {
@@ -346,6 +367,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
         processAndCalibrate(chunk);
       }
     }
+    logger.info(`[R${rid}] Stream loop exited, clientDisconnected=${clientDisconnected}`);
   } catch (streamErr: unknown) {
     const errMsg = streamErr instanceof Error ? streamErr.message : String(streamErr);
     logger.error(`[R${rid}] Error during stream replay: ${errMsg}`);
@@ -357,6 +379,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
     }
+    logger.info(`[R${rid}] Finally block reached, clientDisconnected=${clientDisconnected}`);
   }
 
   if (!clientDisconnected) {
@@ -375,11 +398,14 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
       );
     }
 
+    logger.info(`[R${rid}] About to call finalize...`);
     writer.finalize(true);
+    logger.info(`[R${rid}] Finalize returned, about to res.end()`);
+    res.end();
     logger.info(`[R${rid}] <<< Completed: ${sseEventCount} SSE events`);
+  } else {
+    logger.warn(`[R${rid}] Client disconnected, skipping finalize`);
   }
-
-  res.end();
 }
 
 // --- Helper: fetch and buffer until we see real content ---
@@ -512,15 +538,25 @@ async function fetchAndBufferUntilContent(
     // Case 2: Check buffered chunks for error indicators (no choices, error-like structure)
     for (const chunk of bufferedChunks) {
       const chunkObj = chunk as unknown as Record<string, unknown>;
-      if (!chunk.choices?.length && chunkObj.error) {
-        const errMsg = JSON.stringify(chunkObj.error);
-        logger.error(`[R${rid}] Backend error in SSE chunk: ${errMsg}`);
-        return { kind: "error", status: 400, message: errMsg };
+      if (!chunk.choices?.length) {
+        // Check for error in various formats
+        if (chunkObj.error) {
+          const errMsg = JSON.stringify(chunkObj.error);
+          logger.error(`[R${rid}] Backend error in SSE chunk: ${errMsg}`);
+          return { kind: "error", status: 400, message: errMsg };
+        }
+        // WPS/GLM error format: {"code":"504","message":"...","type":"模型推理异常"}
+        if (chunkObj.code && chunkObj.message) {
+          const errMsg = `[${chunkObj.code}] ${chunkObj.message}${chunkObj.type ? ` (${chunkObj.type})` : ''}`;
+          logger.error(`[R${rid}] Backend error in SSE chunk: ${errMsg}`);
+          return { kind: "error", status: typeof chunkObj.code === 'number' ? chunkObj.code : 500, message: errMsg };
+        }
       }
     }
 
     // Otherwise treat as stub-reject
     logger.warn(`[R${rid}] Stub-reject detected: ${rawContent.length} bytes, no real content`);
+    logger.debug(`[R${rid}] Stub-reject raw content: ${rawContent}`);
     return { kind: "empty", rawContent };
   }
 
