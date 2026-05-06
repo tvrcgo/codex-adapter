@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+﻿import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import yaml from "js-yaml";
 
@@ -12,6 +12,7 @@ export interface BackendConfig {
   extraBody?: Record<string, unknown> | null;  // null to disable default extraBody
   /** When true and request has tools, force tool_choice="required" to prevent text-only responses */
   forceToolChoice?: boolean;
+  stripParams?: string[];
 }
 
 export interface AdapterConfig {
@@ -36,6 +37,7 @@ interface RawBackend {
   extra_headers?: Record<string, string>;
   extra_body?: Record<string, unknown> | null;
   force_tool_choice?: boolean;
+  strip_params?: string[];
 }
 
 interface RawConfig {
@@ -72,6 +74,7 @@ function parseBackend(b: RawBackend, index: number): BackendConfig {
     extraHeaders: b.extra_headers,
     extraBody,
     forceToolChoice: b.force_tool_choice,
+    stripParams: b.strip_params,
   };
 }
 

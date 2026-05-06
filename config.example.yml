@@ -1,7 +1,7 @@
 # codex-adapter 配置文件
 # 复制为 config.yml 后修改
 
-port: 3321
+port: 8003
 log_level: info
 
 # 支持配置多个后端，通过请求中的 model 名称自动路由

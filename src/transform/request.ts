@@ -14,6 +14,7 @@ import type {
   ChatTool,
 } from "./types.js";
 import { convertTools, convertToolChoice } from "./tools.js";
+import { getCachedReasoning, makeReasoningKey } from "../utils/reasoning-cache.js";
 
 export function transformRequest(
   body: ResponsesRequest,
@@ -22,8 +23,24 @@ export function transformRequest(
   let messages = buildMessages(body);
   messages = validateMessageSequence(messages);
 
+  for (const msg of messages) {
+    if (msg.role === "assistant") {
+      const aMsg = msg as ChatAssistantMessage;
+      const toolCallIds = aMsg.tool_calls?.map(tc => tc.id);
+      const key = makeReasoningKey(aMsg.content, toolCallIds);
+      const reasoning = getCachedReasoning(key);
+      if (reasoning) {
+        aMsg.reasoning_content = reasoning;
+      }
+    }
+  }
+
+  const model = backend.models.includes(body.model)
+    ? body.model
+    : backend.models[0];
+
   const req: ChatCompletionsRequest = {
-    model: body.model,
+    model,
     messages,
     stream: true,
   };
@@ -42,22 +59,6 @@ export function transformRequest(
     } else {
       const toolChoice = convertToolChoice(body.tool_choice);
       if (toolChoice) req.tool_choice = toolChoice;
-    }
-  }
-
-  if (body.text?.format) {
-    const fmt = body.text.format;
-    if (fmt.type === "json_object") {
-      req.response_format = { type: "json_object" };
-    } else if (fmt.type === "json_schema" && fmt.schema) {
-      req.response_format = {
-        type: "json_schema",
-        json_schema: {
-          name: fmt.name ?? "response",
-          schema: fmt.schema,
-          strict: fmt.strict,
-        },
-      };
     }
   }
 

@@ -12,6 +12,7 @@ import type {
 import { sendEvent } from "../utils/sse.js";
 import { genResponseId, genMessageId, genItemId, genCallId } from "../utils/id.js";
 import { logger } from "../utils/logger.js";
+import { cacheReasoning, makeReasoningKey } from "../utils/reasoning-cache.js";
 
 interface ActiveToolCall {
   index: number;
@@ -43,6 +44,7 @@ export class ResponseStreamWriter {
   private messageItemId: string | null = null;
   private messageOutputIndex: number = -1;
   private textContent: string = "";
+  private reasoningContent: string = "";
   private textPartEmitted: boolean = false;
 
   // Tool call state
@@ -82,22 +84,14 @@ export class ResponseStreamWriter {
       };
     }
 
-    // Debug: log chunk structure for empty choices
-    if (!chunk.choices?.length) {
-      logger.debug(`[processChunk] No choices in chunk: ${JSON.stringify(chunk).slice(0, 200)}`);
-      return;
-    }
+    if (!chunk.choices?.length) return;
 
     for (const choice of chunk.choices) {
       const delta = choice.delta;
-      if (!delta) {
-        logger.debug(`[processChunk] No delta in choice: ${JSON.stringify(choice).slice(0, 100)}`);
-        continue;
-      }
+      if (!delta) continue;
 
-      // Log finish_reason for debugging stream termination
-      if (choice.finish_reason) {
-        logger.info(`[processChunk] finish_reason=${choice.finish_reason}`);
+      if (delta.reasoning_content != null && delta.reasoning_content !== "") {
+        this.reasoningContent += delta.reasoning_content;
       }
 
       if (delta.content != null && delta.content !== "") {
@@ -105,7 +99,6 @@ export class ResponseStreamWriter {
       }
 
       if (delta.tool_calls) {
-        logger.debug(`[processChunk] tool_calls received: ${JSON.stringify(delta.tool_calls)}`);
         for (const tc of delta.tool_calls) {
           this.handleToolCallDelta(tc);
         }
@@ -115,17 +108,14 @@ export class ResponseStreamWriter {
 
   /** Call after the upstream stream ends ([DONE]) to emit closing events. */
   finalize(hasContent: boolean = true): void {
-    logger.info(`[finalize] Called with hasContent=${hasContent} xmlBufferLen=${this.xmlContentBuffer.length} textLen=${this.textContent.length} toolCalls=${this.activeToolCalls.size}`);
-
     // Flush any remaining XML buffer as text
     if (this.xmlContentBuffer) {
       const toFlush = this.xmlContentBuffer;
       this.xmlContentBuffer = "";
-      logger.info(`[finalize] Flushing xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 200)}`);
+      logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
       this.handleTextDelta(toFlush);
     }
 
-    logger.debug(`[finalize] Before close: activeToolCalls.size=${this.activeToolCalls.size} messageItemId=${this.messageItemId ?? "null"} textContent.length=${this.textContent.length}`);
 
     // If backend sent tool_calls without any text content, synthesize a message item
     // so Codex CLI receives proper SSE events (output_item.added, content_part.added, etc.)
@@ -194,6 +184,16 @@ export class ResponseStreamWriter {
     this.closeTextMessage();
     this.closeAllToolCalls();
 
+    // Cache reasoning content for reuse
+    if (this.reasoningContent) {
+      const toolCallIds = Array.from(this.activeToolCalls.values()).map(tc => tc.callId);
+      const key = makeReasoningKey(this.textContent, toolCallIds);
+      cacheReasoning(key, this.reasoningContent);
+    }
+
+    this.closeTextMessage();
+    this.closeAllToolCalls();
+
     const outputItems = this.buildOutputItems();
 
     // Log if text-only response (no tool calls)
@@ -223,12 +223,11 @@ export class ResponseStreamWriter {
     }
 
     const response = this.buildResponseObject("completed", outputItems);
-    logger.info(`[finalize] Sending response.completed: status=${response.status} usage=${JSON.stringify(response.usage)} output_items=${outputItems.length}`);
+    logger.debug(`[finalize] usage=${JSON.stringify(response.usage)} output_items=${outputItems.length}`);
     sendEvent(this.res, "response.completed", {
       type: "response.completed",
       response,
     });
-    logger.info(`[finalize] response.completed event sent`);
   }
 
   /** Call on upstream error. */
@@ -250,7 +249,7 @@ export class ResponseStreamWriter {
     });
   }
 
-  // â”€â”€â”€ Content delta with XML tool call detection â”€â”€â”€
+  // ©¤©¤©¤ Content delta with XML tool call detection ©¤©¤©¤
 
   /**
    * Handle content delta: detect XML-style tool calls from backends
@@ -259,40 +258,17 @@ export class ResponseStreamWriter {
    * Also filters out thinking content (e.g., <millennia-thinking> tags).
    */
   private handleContentDelta(content: string): void {
-    // Log ALL incoming content for diagnosis (not just XML/tool hints)
-    const incomingLen = content.length;
-    if (incomingLen > 50 || content.includes("<") || content.includes("tool") || content.includes("command") || content.includes("execute") || content.includes("è°ƒç”¨") || content.includes("æ‰§è¡Œ")) {
-      logger.info(`[handleContentDelta] Incoming ${incomingLen} chars: "${content.slice(0, 100)}"`);
-    } else {
-      logger.debug(`[handleContentDelta] Incoming ${incomingLen} chars: "${content}"`);
-    }
-
     this.xmlContentBuffer += content;
-    const bufLenBefore = this.xmlContentBuffer.length;
-
-    // First, strip out any thinking content (millennia-thinking tags from GLM-5)
-    const beforeStrip = this.xmlContentBuffer;
-    this.xmlContentBuffer = this.stripThinkingContent(this.xmlContentBuffer);
     const bufLen = this.xmlContentBuffer.length;
 
-    // Log if thinking content was stripped
-    if (beforeStrip.length !== bufLen) {
-      const strippedLen = beforeStrip.length - bufLen;
-      logger.info(`[handleContentDelta] Stripped ${strippedLen} chars thinking content; buffer now ${bufLen} chars`);
-      // Log what was stripped (helpful for debugging if tool calls are in thinking content)
-      const strippedMatch = beforeStrip.match(/<millennia-thinking>[\s\S]*?<\/millennia-thinking>/gi);
-      if (strippedMatch) {
-        logger.info(`[handleContentDelta] Stripped thinking content: ${strippedMatch.join("").slice(0, 500)}`);
-      }
-    }
+    // First, strip out any thinking content (millennia-thinking tags from GLM-5)
+    this.xmlContentBuffer = this.stripThinkingContent(this.xmlContentBuffer);
 
     // Try to extract complete XML tool calls from the buffer
     const extracted = this.extractXmlToolCalls(this.xmlContentBuffer);
     if (extracted) {
       const { calls, remaining, textBefore } = extracted;
       this.xmlContentBuffer = remaining;
-
-      logger.info(`[handleContentDelta] Extracted ${calls.length} XML tool calls; textBefore=${textBefore.length} chars; remaining=${remaining.length} chars`);
 
       // Emit any text before the XML tags as regular text
       if (textBefore) {
@@ -308,7 +284,9 @@ export class ResponseStreamWriter {
     // Check if we're potentially in the middle of an XML tool call
     if (this.isPartialXmlToolCall(this.xmlContentBuffer)) {
       // Don't emit yet - wait for more content to complete the pattern
-      logger.info(`[handleContentDelta] Buffering ${bufLen} chars for partial XML: ${this.xmlContentBuffer.slice(0, 200)}`);
+      if (bufLen > 100) {
+        logger.debug(`[handleContentDelta] Buffering ${bufLen} chars for partial XML: ${this.xmlContentBuffer.slice(-100)}`);
+      }
       return;
     }
 
@@ -316,13 +294,6 @@ export class ResponseStreamWriter {
     if (this.xmlContentBuffer) {
       const toFlush = this.xmlContentBuffer;
       this.xmlContentBuffer = "";
-
-      // Log if flushing content that mentions tool usage but wasn't detected as tool call
-      const flushLower = toFlush.toLowerCase();
-      if (flushLower.includes("tool") || flushLower.includes("è°ƒç”¨") || flushLower.includes("ä½¿ç”¨") || flushLower.includes("æ‰§è¡Œ") || flushLower.includes("å‘½ä»¤") || flushLower.includes("å†™æ–‡ä»¶") || flushLower.includes("æœç´¢")) {
-        logger.warn(`[handleContentDelta] Flushing ${toFlush.length} chars with tool-related keywords (no XML detected): ${toFlush.slice(0, 300)}`);
-      }
-
       this.handleTextDelta(toFlush);
     }
   }
@@ -470,7 +441,7 @@ export class ResponseStreamWriter {
     return false;
   }
 
-  // â”€â”€â”€ Text handling â”€â”€â”€
+  // ©¤©¤©¤ Text handling ©¤©¤©¤
 
   private handleTextDelta(content: string): void {
     if (!this.messageItemId) {
@@ -549,7 +520,7 @@ export class ResponseStreamWriter {
     });
   }
 
-  // â”€â”€â”€ Tool call handling â”€â”€â”€
+  // ©¤©¤©¤ Tool call handling ©¤©¤©¤
 
   private handleToolCallDelta(tc: ChatChunkToolCall): void {
     let active = this.activeToolCalls.get(tc.index);
@@ -570,7 +541,6 @@ export class ResponseStreamWriter {
         headerEmitted: false,
       };
       this.activeToolCalls.set(tc.index, active);
-      logger.debug(`[handleToolCallDelta] After set: activeToolCalls.size=${this.activeToolCalls.size} keys=[${Array.from(this.activeToolCalls.keys()).join(",")}]`);
     }
 
     if (!active) {
@@ -591,9 +561,6 @@ export class ResponseStreamWriter {
 
     if (tc.function?.arguments) {
       active.arguments += tc.function.arguments;
-
-      // Log each arguments delta for debugging
-      logger.debug(`[handleToolCallDelta] index=${tc.index} args_delta_len=${tc.function.arguments.length} total_args_len=${active.arguments.length}`);
 
       if (!active.headerEmitted) {
         this.emitToolCallHeader(active);
@@ -628,55 +595,13 @@ export class ResponseStreamWriter {
   }
 
   private closeAllToolCalls(): void {
-    logger.debug(`[closeAllToolCalls] Processing ${this.activeToolCalls.size} tool calls`);
     for (const active of this.activeToolCalls.values()) {
-      // Fix double-escaped command: backend sometimes returns {"command": "[\"powershell\", ...]"}
-      // instead of {"command": ["powershell", ...]}. Parse and fix before sending to Codex.
-      let finalArgs = active.arguments;
-      try {
-        const parsed = JSON.parse(finalArgs);
-        if (parsed.command && typeof parsed.command === "string") {
-          // Command is a string â€” try to parse it as JSON array
-          const cmdStr = parsed.command;
-          try {
-            // Backend may embed raw control characters (newlines, etc.) in the JSON string
-            // which break JSON.parse. Escape them first.
-            const sanitized = cmdStr.replace(/[\x00-\x1f]/g, (ch: string) => {
-              const code = ch.charCodeAt(0);
-              if (code === 10) return "\\n";
-              if (code === 13) return "\\r";
-              if (code === 9) return "\\t";
-              return "\\u" + code.toString(16).padStart(4, "0");
-            });
-            const innerParsed = JSON.parse(sanitized);
-            if (Array.isArray(innerParsed)) {
-              parsed.command = innerParsed;
-              finalArgs = JSON.stringify(parsed);
-              logger.info(`[closeAllToolCalls] Fixed double-escaped command for ${active.name}: array with ${innerParsed.length} items`);
-            }
-          } catch (innerErr) {
-            logger.info(`[closeAllToolCalls] Command is string but not valid JSON array, err=${innerErr instanceof Error ? innerErr.message : String(innerErr)}, cmd_preview=${cmdStr.slice(0, 200)}`);
-          }
-        }
-      } catch (outerErr) {
-        logger.warn(`[closeAllToolCalls] Failed to parse arguments as JSON: ${outerErr instanceof Error ? outerErr.message : String(outerErr)}, args_preview=${finalArgs.slice(0, 200)}`);
-      }
-
-      // Log the actual arguments being sent to Codex for debugging
-      if (finalArgs.length > 500) {
-        logger.info(`[closeAllToolCalls] name=${active.name} call_id=${active.callId} arguments_len=${finalArgs.length}`);
-        logger.debug(`[closeAllToolCalls] FULL args: ${finalArgs}`);
-      } else {
-        logger.info(`[closeAllToolCalls] name=${active.name} call_id=${active.callId} arguments_len=${finalArgs.length} arguments_preview=${finalArgs}`);
-      }
-
-      // Use finalArgs instead of active.arguments
       sendEvent(this.res, "response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         item_id: active.itemId,
         output_index: active.outputIndex,
         call_id: active.callId,
-        arguments: finalArgs,
+        arguments: active.arguments,
       });
 
       sendEvent(this.res, "response.output_item.done", {
@@ -687,14 +612,14 @@ export class ResponseStreamWriter {
           type: "function_call",
           call_id: active.callId,
           name: active.name,
-          arguments: finalArgs,
+          arguments: active.arguments,
           status: "completed",
         },
       });
     }
   }
 
-  // â”€â”€â”€ Response object builders â”€â”€â”€
+  // ©¤©¤©¤ Response object builders ©¤©¤©¤
 
   private emitCreated(chunk?: ChatCompletionChunk): void {
     const response = this.buildResponseObject("in_progress", []);
@@ -735,10 +660,6 @@ export class ResponseStreamWriter {
   private buildOutputItems(): ResponseOutputItem[] {
     const items: ResponseOutputItem[] = [];
 
-    // Debug: log state at build time
-    logger.debug(`[buildOutputItems] activeToolCalls.size=${this.activeToolCalls.size} messageItemId=${this.messageItemId ?? "null"}`);
-
-    // Ensure there's always a message item (Codex CLI expects it in output)
     if (this.messageItemId) {
       const content: ResponseContentPart[] = [
         { type: "output_text", text: this.textContent, annotations: [] },
@@ -750,18 +671,6 @@ export class ResponseStreamWriter {
         status: "completed",
         content,
       });
-    } else if (this.activeToolCalls.size > 0) {
-      // Backend sent tool_calls without any content â€” synthesize an empty message
-      // so Codex CLI receives a valid output structure
-      const synthId = genMessageId();
-      items.push({
-        id: synthId,
-        type: "message",
-        role: "assistant",
-        status: "completed",
-        content: [{ type: "output_text", text: "", annotations: [] }],
-      });
-      logger.debug(`[buildOutputItems] Synthesized empty message (no content from backend, but has tool calls)`);
     }
 
     for (const active of this.activeToolCalls.values()) {
