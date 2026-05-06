@@ -88,19 +88,15 @@ async function handleAnthropicMessages(
     headers["Authorization"] = `Bearer ${backend.apiKey}`;
   }
 
-  // Add extra headers from config
+  // Add extra headers from config, allow client request to override
   if (backend.extraHeaders) {
     for (const [key, value] of Object.entries(backend.extraHeaders)) {
-      headers[key] = encodeHeaderValue(value);
-    }
-  }
-
-  // Forward extra headers from request
-  const forwardHeaders = ["x-wps-uid", "x-wps-name", "cookie"];
-  for (const h of forwardHeaders) {
-    const val = req.headers[h.toLowerCase()];
-    if (val) {
-      headers[h] = Array.isArray(val) ? val[0] : val;
+      const clientVal = req.headers[key.toLowerCase()];
+      if (clientVal) {
+        headers[key] = Array.isArray(clientVal) ? clientVal[0] : clientVal;
+      } else if (value) {
+        headers[key] = encodeHeaderValue(value);
+      }
     }
   }
 

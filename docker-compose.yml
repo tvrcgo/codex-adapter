@@ -4,5 +4,5 @@ services:
     build: .
     container_name: codex-adapter
     ports:
-      - "18003:8003"
+      - "18003:3321"
     restart: unless-stopped

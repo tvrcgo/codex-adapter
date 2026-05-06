@@ -22,7 +22,7 @@ docker-compose up -d --build
 - 任务执行过程中的临时文件，任务结束后要清理
 - 项目根目录不要留临时文件
 - 所有修改先部署到docker再调试
-- commit 详情用列表格式逐条列出主要改动点，不要罗列代码（通过 claude 提交的 commit 加上 Co-author: claude <noreply@anthropic.com>；通过 codex 提交的 commit 加上 Co-author: codex <codex@openai.com>）
+- commit message 格式：`类型(模块): 概括描述改动点`，模块不明确时可省略；详情用列表格式逐行列出主要改动点，不要罗列代码（通过 claude 提交的 commit 加上 Co-authored-by: claude <noreply@anthropic.com>；通过 codex 提交的 commit 加上 Co-authored-by: codex <codex@openai.com>）
 
 ## 红线
 

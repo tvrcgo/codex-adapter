@@ -191,9 +191,6 @@ export class ResponseStreamWriter {
       cacheReasoning(key, this.reasoningContent);
     }
 
-    this.closeTextMessage();
-    this.closeAllToolCalls();
-
     const outputItems = this.buildOutputItems();
 
     // Log if text-only response (no tool calls)
@@ -249,7 +246,7 @@ export class ResponseStreamWriter {
     });
   }
 
-  // ©¤©¤©¤ Content delta with XML tool call detection ©¤©¤©¤
+  // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Content delta with XML tool call detection ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
   /**
    * Handle content delta: detect XML-style tool calls from backends
@@ -441,7 +438,7 @@ export class ResponseStreamWriter {
     return false;
   }
 
-  // ©¤©¤©¤ Text handling ©¤©¤©¤
+  // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Text handling ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
   private handleTextDelta(content: string): void {
     if (!this.messageItemId) {
@@ -518,9 +515,13 @@ export class ResponseStreamWriter {
         content: [{ type: "output_text", text: this.textContent, annotations: [] }],
       },
     });
+
+    // Reset state to prevent duplicate close events
+    this.messageItemId = null;
+    this.textPartEmitted = false;
   }
 
-  // ©¤©¤©¤ Tool call handling ©¤©¤©¤
+  // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Tool call handling ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
   private handleToolCallDelta(tc: ChatChunkToolCall): void {
     let active = this.activeToolCalls.get(tc.index);
@@ -595,7 +596,11 @@ export class ResponseStreamWriter {
   }
 
   private closeAllToolCalls(): void {
-    for (const active of this.activeToolCalls.values()) {
+    // Clear the map first to prevent duplicate close events
+    const calls = Array.from(this.activeToolCalls.values());
+    this.activeToolCalls.clear();
+
+    for (const active of calls) {
       sendEvent(this.res, "response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         item_id: active.itemId,
@@ -619,7 +624,7 @@ export class ResponseStreamWriter {
     }
   }
 
-  // ©¤©¤©¤ Response object builders ©¤©¤©¤
+  // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Response object builders ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
   private emitCreated(chunk?: ChatCompletionChunk): void {
     const response = this.buildResponseObject("in_progress", []);

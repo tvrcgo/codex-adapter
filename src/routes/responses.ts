@@ -6,6 +6,7 @@ import { transformRequest, estimateTokens, estimateToolTokens, compressToolMessa
 import { ResponseStreamWriter } from "../transform/response-stream.js";
 import { initSSE, parseSSEBuffer } from "../utils/sse.js";
 import { logger } from "../utils/logger.js";
+import { saveRequestRecord, updateRequestRecord } from "../utils/request-recorder.js";
 
 // --- Token estimation calibration ---
 // When backend returns real prompt_tokens, we calibrate our estimator.
@@ -100,6 +101,11 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   const rid = ++reqCounter;
   const body = req.body as ResponsesRequest;
 
+  // Save full request body for inspection/replay
+  saveRequestRecord(body, null, `${body.model}_R${rid}`).catch(err =>
+    logger.warn(`[R${rid}] Failed to save request record: ${err}`)
+  );
+
   // Log request body for debugging
   logger.debug(`[R${rid}] RAW request body: ${JSON.stringify(body).slice(0, 5000)}`);
 
@@ -124,6 +130,8 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   let chatReq: ChatCompletionsRequest;
   try {
     chatReq = transformRequest(body, backend);
+    // Save transformed request for debugging
+    saveRequestRecord(body, chatReq, `${body.model}_R${rid}_transformed`).catch(() => {});
   } catch (err) {
     logger.error(`[R${rid}] Transform failed`, err);
     res.status(400).json({
@@ -186,7 +194,12 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
 
   if (backend.extraHeaders) {
     for (const [key, value] of Object.entries(backend.extraHeaders)) {
-      headers[key] = encodeHeaderValue(value);
+      const clientVal = req.headers[key.toLowerCase()];
+      if (clientVal) {
+        headers[key] = Array.isArray(clientVal) ? clientVal[0] : clientVal;
+      } else if (value) {
+        headers[key] = encodeHeaderValue(value);
+      }
     }
   }
 
