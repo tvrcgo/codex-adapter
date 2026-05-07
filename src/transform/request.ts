@@ -145,6 +145,7 @@ function mergeSystemMessages(messages: ChatMessage[]): ChatMessage[] {
 
 /**
  * Validate and clean message sequence for Chat Completions API compatibility.
+ * - Merge consecutive assistant messages (backends like GLM-5 reject them)
  * - Remove orphaned tool messages (no matching preceding tool_call_id)
  * - Deduplicate duplicate tool_call_id in tool messages
  */
@@ -159,19 +160,47 @@ function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
     }
   }
 
-  // Second pass: track seen tool_call_ids and filter orphaned/duplicate tool messages
+  // Second pass: filter + merge
   const seenCallIds = new Set<string>();
   const result: ChatMessage[] = [];
 
   for (const msg of messages) {
     if (msg.role === "tool" && "tool_call_id" in msg) {
       const callId = msg.tool_call_id;
-      // Skip orphaned tool message (no matching call_id in history)
       if (!allCallIds.has(callId)) continue;
-      // Skip duplicate tool_call_id
       if (seenCallIds.has(callId)) continue;
       seenCallIds.add(callId);
     }
+
+    // Merge consecutive assistant messages to avoid backend rejection.
+    // Codex CLI may produce these when duplicate output_item.done events
+    // are recorded, or when an empty synth message precedes a tool call.
+    const prev = result.length > 0 ? result[result.length - 1] : null;
+    if (msg.role === "assistant" && prev && prev.role === "assistant") {
+      const prevAsst = prev as ChatAssistantMessage;
+      const curAsst = msg as ChatAssistantMessage;
+
+      // Merge content: keep non-empty content, prefer the one with substance
+      if (curAsst.content && (!prevAsst.content || prevAsst.content === "")) {
+        prevAsst.content = curAsst.content;
+      }
+
+      // Merge tool_calls
+      if ("tool_calls" in curAsst && curAsst.tool_calls?.length) {
+        prevAsst.tool_calls = [
+          ...(prevAsst.tool_calls ?? []),
+          ...curAsst.tool_calls,
+        ];
+      }
+
+      // Merge reasoning_content
+      if (curAsst.reasoning_content && !prevAsst.reasoning_content) {
+        prevAsst.reasoning_content = curAsst.reasoning_content;
+      }
+
+      continue; // skip pushing; merged into prev
+    }
+
     result.push(msg);
   }
 

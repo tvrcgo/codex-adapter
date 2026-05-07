@@ -133,14 +133,33 @@ async function handleAnthropicMessages(
     return;
   }
 
-  // Handle streaming response
-  const isStream = body.stream ?? true;
-  if (!isStream) {
-    const text = await upstream.text();
-    logger.debug(`[A${rid}] Non-stream response: ${text.slice(0, 500)}`);
-    res.status(200).send(text);
-    return;
-  }
+ // Handle streaming response
+ const isStream = body.stream ?? true;
+ if (!isStream) {
+   const text = await upstream.text();
+   logger.debug(`[A${rid}] Non-stream response: ${text.slice(0, 500)}`);
+   try {
+     const chatResponse = JSON.parse(text);
+     const anthropicResponse = {
+       id: `msg_${Date.now().toString(36)}`,
+       type: "message",
+       role: "assistant",
+       content: [{ type: "text", text: chatResponse.choices?.[0]?.message?.content ?? "" }],
+       model: body.model,
+       stop_reason: chatResponse.choices?.[0]?.finish_reason ?? "end_turn",
+       stop_sequence: null,
+       usage: {
+         input_tokens: chatResponse.usage?.prompt_tokens ?? 0,
+         output_tokens: chatResponse.usage?.completion_tokens ?? 0,
+       },
+     };
+     res.status(200).json(anthropicResponse);
+   } catch (err) {
+     logger.error(`[A${rid}] Failed to parse non-stream response: ${err}`);
+     res.status(200).send(text);
+   }
+   return;
+ }
 
   // Streaming: set SSE headers
   initSSE(res);

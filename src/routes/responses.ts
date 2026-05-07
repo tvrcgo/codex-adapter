@@ -327,7 +327,9 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     // Log finish_reason for debugging
     const finishReason = chunk.choices?.[0]?.finish_reason;
     if (finishReason) {
-      logger.info(`[R${rid}] processAndCalibrate: finish_reason=${finishReason}, count=${sseEventCount}`);
+      const hasToolCalls = chunk.choices?.some(c => c.delta?.tool_calls?.length) ?? false;
+      const hasContent = chunk.choices?.some(c => c.delta?.content != null && c.delta.content !== "") ?? false;
+      logger.info(`[R${rid}] processAndCalibrate: finish_reason=${finishReason}, hasToolCalls=${hasToolCalls}, hasContent=${hasContent}, count=${sseEventCount}`);
     }
     writer.processChunk(chunk);
 

@@ -55,6 +55,12 @@ export class ResponseStreamWriter {
   private xmlContentBuffer: string = "";
   private xmlToolCallIndex: number = 1000;
 
+  // Thinking block state machine
+  // Tracks whether we're inside a thinking block to suppress output
+  private inThinkingBlock: boolean = false;
+  private thinkingTagType: string | null = null; // 'millennia', 'think', 'thought'
+  private thinkingBuffer: string = ""; // Accumulate content while in thinking block
+
   private usage: ResponseUsage | null = null;
 
   constructor(res: Response, model: string, inputTokenOffset: number = 0) {
@@ -95,6 +101,14 @@ export class ResponseStreamWriter {
       }
 
       if (delta.content != null && delta.content !== "") {
+        // Log every content delta for root-cause analysis
+        const raw = delta.content;
+        const hasSpecial = /[<>\u0000-\u001f\u0080-\u009f]/.test(raw) || raw.includes('think');
+        if (hasSpecial || raw.length > 0) {
+          // Log repr-style: escape control chars and show exact content
+          const repr = JSON.stringify(raw);
+          logger.info(`[processChunk] raw content delta (${raw.length} chars): ${repr.length > 500 ? repr.slice(0, 500) + '...' : repr}`);
+        }
         this.handleContentDelta(delta.content);
       }
 
@@ -110,16 +124,41 @@ export class ResponseStreamWriter {
   finalize(hasContent: boolean = true): void {
     // Flush any remaining XML buffer as text
     if (this.xmlContentBuffer) {
-      const toFlush = this.xmlContentBuffer;
-      this.xmlContentBuffer = "";
-      logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
-      this.handleTextDelta(toFlush);
+      // If still in a thinking block at finalize, discard it (unclosed thinking tag)
+      if (this.inThinkingBlock) {
+        logger.info(`[finalize] Discarding unclosed thinking block (${this.thinkingTagType}), ${this.xmlContentBuffer.length} chars buffered`);
+        this.xmlContentBuffer = "";
+        this.inThinkingBlock = false;
+        this.thinkingTagType = null;
+        this.thinkingBuffer = "";
+      } else {
+        // Strip any remaining orphan closing tags
+        this.xmlContentBuffer = this.xmlContentBuffer
+          .replace(/<\/millennia-thinking>/gi, "")
+          .replace(/<\/think>/gi, "")
+          .replace(/<\|end_of_thought\|>/gi, "");
+      }
+
+      if (this.xmlContentBuffer) {
+        const toFlush = this.xmlContentBuffer;
+        this.xmlContentBuffer = "";
+        logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
+        this.handleTextDelta(toFlush);
+      }
     }
 
 
     // If backend sent tool_calls without any text content, synthesize a message item
     // so Codex CLI receives proper SSE events (output_item.added, content_part.added, etc.)
     // Use the next available output_index so it doesn't collide with already-emitted tool calls.
+    //
+    // IMPORTANT: We emit the full lifecycle here (added → done) and do NOT set
+    // messageItemId/textPartEmitted, so closeTextMessage() won't re-emit done events.
+    // Codex CLI appends every output_item.done as a separate history entry without
+    // dedup, so duplicate done events cause consecutive empty assistant messages in
+    // the next request — which GLM-5 rejects as "模型推理异常".
+    let synthOutputItem: ResponseOutputItem | null = null;
+
     if (!this.messageItemId && this.activeToolCalls.size > 0) {
       const synthId = genMessageId();
       const synthOutputIndex = this.nextOutputIndex++;
@@ -173,14 +212,24 @@ export class ResponseStreamWriter {
         },
       });
 
-      // Track for buildOutputItems
-      this.messageItemId = synthId;
-      this.messageOutputIndex = synthOutputIndex;
-      this.textContent = "";
-      this.textPartEmitted = true;
+      synthOutputItem = {
+        id: synthId,
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "", annotations: [] }],
+      };
+
       logger.info(`[finalize] Synthesized message item at output_index=${synthOutputIndex} for tool-only response`);
     }
 
+    // Build output items BEFORE closing (which resets state)
+    const outputItems = this.buildOutputItems();
+    if (synthOutputItem) {
+      outputItems.unshift(synthOutputItem);
+    }
+
+    // Now close and send done events
     this.closeTextMessage();
     this.closeAllToolCalls();
 
@@ -191,12 +240,11 @@ export class ResponseStreamWriter {
       cacheReasoning(key, this.reasoningContent);
     }
 
-    const outputItems = this.buildOutputItems();
-
     // Log if text-only response (no tool calls)
-    const hasToolCalls = this.activeToolCalls.size > 0;
+    const hasToolCalls = outputItems.some(item => item.type === "function_call");
     if (this.textContent && !hasToolCalls) {
-      logger.debug(`[finalize] Text-only response (${this.textContent.length} chars): ${this.textContent.slice(0, 500)}`);
+      const repr = JSON.stringify(this.textContent);
+      logger.info(`[finalize] Text-only response (${this.textContent.length} chars): ${repr.length > 1000 ? repr.slice(0, 1000) + '...' : repr}`);
     }
 
     // If no content, synthesize an empty output so Codex receives a valid completed event
@@ -252,22 +300,35 @@ export class ResponseStreamWriter {
    * Handle content delta: detect XML-style tool calls from backends
    * that output tool calls as text (e.g., GLM-5/WPS) and convert them
    * to proper function_call events.
-   * Also filters out thinking content (e.g., <millennia-thinking> tags).
+   * Also filters out thinking content using a state machine that tracks
+   * whether we're inside a thinking block, even when tags don't close properly.
    */
   private handleContentDelta(content: string): void {
     this.xmlContentBuffer += content;
     const bufLen = this.xmlContentBuffer.length;
 
-    // First, strip out any thinking content (millennia-thinking tags from GLM-5)
-    this.xmlContentBuffer = this.stripThinkingContent(this.xmlContentBuffer);
+    // Log incoming content for debugging thinking tag issues
+    if (content.includes('<') || content.includes('>') || content.includes('think')) {
+      logger.debug(`[handleContentDelta] Content with tags: "${content.slice(0, 100)}" -> buffer now ${bufLen} chars, inThinking=${this.inThinkingBlock}`);
+    }
 
-    // Try to extract complete XML tool calls from the buffer
+    // Process buffer through thinking state machine
+    this.processThinkingState();
+
+    // If we're inside a thinking block, keep buffering (don't emit)
+    if (this.inThinkingBlock) {
+      if (bufLen > 100) {
+        logger.debug(`[handleContentDelta] Inside thinking block, buffering ${bufLen} chars`);
+      }
+      return;
+    }
+
+    // After thinking state processing, try to extract XML tool calls
     const extracted = this.extractXmlToolCalls(this.xmlContentBuffer);
     if (extracted) {
       const { calls, remaining, textBefore } = extracted;
       this.xmlContentBuffer = remaining;
 
-      // Emit any text before the XML tags as regular text
       if (textBefore) {
         this.handleTextDelta(textBefore);
       }
@@ -278,11 +339,10 @@ export class ResponseStreamWriter {
       return;
     }
 
-    // Check if we're potentially in the middle of an XML tool call
+    // Check if we're potentially in the middle of an XML tool call pattern
     if (this.isPartialXmlToolCall(this.xmlContentBuffer)) {
-      // Don't emit yet - wait for more content to complete the pattern
       if (bufLen > 100) {
-        logger.debug(`[handleContentDelta] Buffering ${bufLen} chars for partial XML: ${this.xmlContentBuffer.slice(-100)}`);
+        logger.debug(`[handleContentDelta] Buffering ${bufLen} chars for partial pattern: ${this.xmlContentBuffer.slice(-100)}`);
       }
       return;
     }
@@ -296,13 +356,124 @@ export class ResponseStreamWriter {
   }
 
   /**
+   * Process the xmlContentBuffer through the thinking state machine.
+   * Removes thinking content and tracks whether we're inside a thinking block.
+   * Handles cases where thinking tags don't close properly.
+   */
+  private processThinkingState(): void {
+    let buf = this.xmlContentBuffer;
+
+    // Define thinking tag patterns: [opening regex, closing regex, tag type name]
+    const thinkingPatterns: Array<[RegExp, RegExp, string]> = [
+      [/<millennia-thinking[^>]*>/gi, /<\/millennia-thinking>/gi, "millennia"],
+      [/<think>/gi, /<\/think>/gi, "think"],
+      [/<\|begin_of_thought\|>/gi, /<\|end_of_thought\|>/gi, "thought"],
+    ];
+
+    let changed = true;
+    let iterations = 0;
+    const maxIterations = 20; // Safety limit
+
+    while (changed && iterations < maxIterations) {
+      changed = false;
+      iterations++;
+
+      for (const [openRe, closeRe, tagType] of thinkingPatterns) {
+        // Reset regex lastIndex
+        openRe.lastIndex = 0;
+        closeRe.lastIndex = 0;
+
+        if (this.inThinkingBlock) {
+          // We're inside a thinking block - look for closing tag
+          const closeMatch = closeRe.exec(buf);
+          if (closeMatch) {
+            // Found closing tag - remove from opening to closing (inclusive)
+            const beforeClose = buf.slice(0, closeMatch.index);
+            const afterClose = buf.slice(closeMatch.index + closeMatch[0].length);
+            buf = beforeClose + afterClose;
+            this.inThinkingBlock = false;
+            this.thinkingTagType = null;
+            this.thinkingBuffer = "";
+            changed = true;
+            logger.debug(`[processThinkingState] Thinking block closed (${tagType}), remaining buffer: ${buf.length} chars`);
+          }
+          // If no closing tag found, keep buffering (content stays in xmlContentBuffer)
+          continue;
+        }
+
+        // Not in a thinking block - look for opening tag
+        const openMatch = openRe.exec(buf);
+        if (openMatch) {
+          // Found opening tag - check if there's a closing tag after it
+          const afterOpen = buf.slice(openMatch.index + openMatch[0].length);
+          closeRe.lastIndex = 0;
+          const closeMatch = closeRe.exec(afterOpen);
+
+          if (closeMatch) {
+            // Complete thinking block found - remove it entirely
+            const beforeOpen = buf.slice(0, openMatch.index);
+            const afterClose = afterOpen.slice(closeMatch.index + closeMatch[0].length);
+            buf = beforeOpen + afterClose;
+            changed = true;
+            logger.debug(`[processThinkingState] Removed complete thinking block (${tagType})`);
+          } else {
+            // Opening tag found but no closing tag - enter thinking block state
+            // Keep content before the opening tag as regular text
+            const beforeOpen = buf.slice(0, openMatch.index);
+            buf = buf.slice(openMatch.index); // Keep from opening tag onward
+            this.inThinkingBlock = true;
+            this.thinkingTagType = tagType;
+            this.thinkingBuffer = "";
+            changed = true;
+
+            // If there's text before the thinking block, we need to emit it
+            if (beforeOpen) {
+              // Emit the text before the thinking block immediately
+              this.xmlContentBuffer = buf;
+              this.handleTextDelta(beforeOpen);
+              // Don't continue processing - the remaining buffer is the thinking block
+              return;
+            }
+            logger.debug(`[processThinkingState] Entered thinking block (${tagType}), buffering from opening tag`);
+          }
+        }
+      }
+    }
+
+    // Also strip orphan closing tags (e.g.,  without matching opening)
+    buf = buf.replace(/<\/millennia-thinking>/gi, "");
+    buf = buf.replace(/<\/think>/gi, "");
+    buf = buf.replace(/<\|end_of_thought\|>/gi, "");
+
+    this.xmlContentBuffer = buf;
+  }
+
+  /**
    * Strip thinking content from GLM-5/WPS backend.
-   * The <millennia-thinking>...</millennia-thinking> tags contain internal reasoning
-   * that should not be shown to the user.
+   * Various thinking tag formats are supported:
+   * - <millennia-thinking>...</millennia-thinking>
+   * - <think>...</think>
+   * - <|begin_of_thought|>...<|end_of_thought|>
    */
   private stripThinkingContent(content: string): string {
     // Remove complete thinking blocks
-    return content.replace(/<millennia-thinking>[\s\S]*?<\/millennia-thinking>/gi, "");
+    let result = content;
+
+    // GLM-5 millennia-thinking tags
+    result = result.replace(/<millennia-thinking>[\s\S]*?<\/millennia-thinking>/gi, "");
+
+    // Generic <think> tags
+    result = result.replace(/<think>[\s\S]*?<\/think>/gi, "");
+
+    // DeepSeek-style thought markers
+    result = result.replace(/<\|begin_of_thought\|>[\s\S]*?<\|end_of_thought\|>/gi, "");
+
+    // Orphan closing tags (if opening was stripped but closing remains)
+    result = result.replace(/<\/millennia-thinking>/gi, "");
+    result = result.replace(/<\/think>/gi, "");
+    result = result.replace(/<\|end_of_thought\|>/gi, "");
+
+    return result;
   }
 
   /** Emit a single XML-detected tool call as a complete function_call event sequence. */
@@ -416,14 +587,12 @@ export class ResponseStreamWriter {
     const trimmed = content.trimEnd();
     if (!trimmed) return false;
 
-    // Incomplete thinking tag - buffer to hide thinking content
-    if (/<millennia-thinking[^>]*$/i.test(trimmed)) return true;
-    if (/<millennia-thinking[^>]*>/i.test(trimmed) && !/<\/millennia-thinking>/i.test(trimmed)) return true;
+    // Note: thinking tag detection is now handled by processThinkingState() state machine
 
-    // Incomplete opening tag
-    if (/<[a-z]*$/.test(trimmed)) return true;
-    if (/<command[^>]*$/.test(trimmed)) return true;
-    if (/<execute[^>]*$/.test(trimmed)) return true;
+    // Incomplete opening tag (generic)
+    if (/<[a-z]*$/i.test(trimmed)) return true;
+    if (/<command[^>]*$/i.test(trimmed)) return true;
+    if (/<execute[^>]*$/i.test(trimmed)) return true;
 
     // Opened tag but not yet closed
     const openCmd = trimmed.match(/<command[^>]*>/);
