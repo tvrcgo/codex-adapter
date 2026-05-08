@@ -1,13 +1,38 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+﻿import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const;
 
 let threshold: number = LEVELS.info;
 
-const logDir = join(process.cwd(), "logs");
-try { mkdirSync(logDir, { recursive: true }); } catch {}
-const logFile = join(logDir, "adapter.log");
+const LOG_BASE_DIR = join(process.cwd(), "logs");
+try { mkdirSync(LOG_BASE_DIR, { recursive: true }); } catch {}
+
+let currentMonth = "";
+let currentDate = "";
+let logFile = "";
+
+function ensureLogFile(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  const monthStr = `${y}-${m}`;
+  const dateStr = `${y}-${m}-${d}`;
+
+  if (monthStr !== currentMonth) {
+    currentMonth = monthStr;
+    const monthDir = join(LOG_BASE_DIR, monthStr);
+    if (!existsSync(monthDir)) mkdirSync(monthDir, { recursive: true });
+  }
+
+  if (dateStr !== currentDate) {
+    currentDate = dateStr;
+    logFile = join(LOG_BASE_DIR, monthStr, `${dateStr}.log`);
+  }
+
+  return logFile;
+}
 
 export function setLogLevel(level: keyof typeof LEVELS): void {
   threshold = LEVELS[level];
@@ -22,7 +47,7 @@ function log(level: keyof typeof LEVELS, msg: string, data?: unknown): void {
     : "";
   const line = prefix + " " + msg + suffix;
   console.log(line);
-  try { appendFileSync(logFile, line + "\n"); } catch {}
+  try { appendFileSync(ensureLogFile(), line + "\n"); } catch {}
 }
 
 export const logger = {
