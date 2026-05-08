@@ -1,4 +1,4 @@
-import { promises as fs } from "fs";
+﻿import { promises as fs } from "fs";
 import * as path from "path";
 import { logger } from "./logger.js";
 
@@ -16,6 +16,30 @@ async function ensureRecordsDir(): Promise<void> {
   }
 }
 
+function toLocalIsoString(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  const H = String(date.getHours()).padStart(2, "0");
+  const M = String(date.getMinutes()).padStart(2, "0");
+  const S = String(date.getSeconds()).padStart(2, "0");
+  const ms = String(date.getMilliseconds()).padStart(3, "0");
+  return `${y}-${m}-${d}T${H}:${M}:${S}.${ms}`;
+}
+
+function extractDateFromId(id: string): string {
+  const match = id.match(/^req_(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : toLocalIsoString(new Date()).slice(0, 10);
+}
+
+async function ensureDateDir(dateDir: string): Promise<void> {
+  try {
+    await fs.mkdir(dateDir, { recursive: true });
+  } catch (err) {
+    logger.error(`Failed to create date directory ${dateDir}: ${err}`);
+  }
+}
+
 /**
  * Request record structure saved for replay/automation.
  */
@@ -23,8 +47,8 @@ export interface RequestRecord {
   id: string;
   timestamp: string;
   model: string;
-  request: unknown;          // Original ResponsesRequest
-  transformedRequest: unknown;  // ChatCompletionsRequest sent to backend
+  request: unknown;
+  transformedRequest: unknown;
   response?: {
     status: "completed" | "failed";
     output?: unknown;
@@ -37,10 +61,6 @@ export interface RequestRecord {
   }>;
 }
 
-/**
- * Save a request record to disk for later replay/automation.
- * Returns the record ID for later reference.
- */
 export async function saveRequestRecord(
   request: unknown,
   transformedRequest: unknown,
@@ -48,18 +68,22 @@ export async function saveRequestRecord(
 ): Promise<string> {
   await ensureRecordsDir();
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const now = new Date();
+  const timestamp = toLocalIsoString(now).replace(/[:.]/g, "-");
   const id = `req_${timestamp}`;
+  const dateStr = extractDateFromId(id);
+  const dateDir = path.join(RECORDS_DIR, dateStr);
+  await ensureDateDir(dateDir);
 
   const record: RequestRecord = {
     id,
-    timestamp: new Date().toISOString(),
+    timestamp: toLocalIsoString(now),
     model,
     request,
     transformedRequest,
   };
 
-  const filePath = path.join(RECORDS_DIR, `${id}.json`);
+  const filePath = path.join(dateDir, `${id}.json`);
 
   try {
     await fs.writeFile(filePath, JSON.stringify(record, null, 2), "utf-8");
@@ -71,13 +95,12 @@ export async function saveRequestRecord(
   }
 }
 
-/**
- * Load a request record by ID.
- */
 export async function loadRequestRecord(id: string): Promise<RequestRecord | null> {
   await ensureRecordsDir();
 
-  const filePath = path.join(RECORDS_DIR, `${id}.json`);
+  const dateStr = extractDateFromId(id);
+  const dateDir = path.join(RECORDS_DIR, dateStr);
+  const filePath = path.join(dateDir, `${id}.json`);
 
   try {
     const content = await fs.readFile(filePath, "utf-8");
@@ -88,27 +111,31 @@ export async function loadRequestRecord(id: string): Promise<RequestRecord | nul
   }
 }
 
-/**
- * List all request records.
- */
 export async function listRequestRecords(): Promise<Array<{ id: string; timestamp: string; model: string }>> {
   await ensureRecordsDir();
 
   try {
-    const files = await fs.readdir(RECORDS_DIR);
+    const dateDirs = await fs.readdir(RECORDS_DIR);
     const records: Array<{ id: string; timestamp: string; model: string }> = [];
 
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      try {
-        const content = await fs.readFile(path.join(RECORDS_DIR, file), "utf-8");
-        const record = JSON.parse(content) as RequestRecord;
-        records.push({
-          id: record.id,
-          timestamp: record.timestamp,
-          model: record.model,
-        });
-      } catch {}
+    for (const dateDir of dateDirs) {
+      const datePath = path.join(RECORDS_DIR, dateDir);
+      const stat = await fs.stat(datePath).catch(() => null);
+      if (!stat || !stat.isDirectory()) continue;
+
+      const files = await fs.readdir(datePath);
+      for (const file of files) {
+        if (!file.endsWith(".json")) continue;
+        try {
+          const content = await fs.readFile(path.join(datePath, file), "utf-8");
+          const record = JSON.parse(content) as RequestRecord;
+          records.push({
+            id: record.id,
+            timestamp: record.timestamp,
+            model: record.model,
+          });
+        } catch {}
+      }
     }
 
     return records.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
@@ -118,9 +145,6 @@ export async function listRequestRecords(): Promise<Array<{ id: string; timestam
   }
 }
 
-/**
- * Update a request record with response info.
- */
 export async function updateRequestRecord(
   id: string,
   update: {
@@ -130,7 +154,9 @@ export async function updateRequestRecord(
 ): Promise<void> {
   await ensureRecordsDir();
 
-  const filePath = path.join(RECORDS_DIR, `${id}.json`);
+  const dateStr = extractDateFromId(id);
+  const dateDir = path.join(RECORDS_DIR, dateStr);
+  const filePath = path.join(dateDir, `${id}.json`);
 
   try {
     const content = await fs.readFile(filePath, "utf-8");
@@ -150,13 +176,12 @@ export async function updateRequestRecord(
   }
 }
 
-/**
- * Delete a request record.
- */
 export async function deleteRequestRecord(id: string): Promise<boolean> {
   await ensureRecordsDir();
 
-  const filePath = path.join(RECORDS_DIR, `${id}.json`);
+  const dateStr = extractDateFromId(id);
+  const dateDir = path.join(RECORDS_DIR, dateStr);
+  const filePath = path.join(dateDir, `${id}.json`);
 
   try {
     await fs.unlink(filePath);
@@ -168,10 +193,6 @@ export async function deleteRequestRecord(id: string): Promise<boolean> {
   }
 }
 
-/**
- * Get all pending tool calls (requests that have tool_calls but no response yet).
- * Useful for automation - find work that needs to be done.
- */
 export async function getPendingToolCalls(): Promise<Array<{
   recordId: string;
   timestamp: string;
@@ -179,28 +200,34 @@ export async function getPendingToolCalls(): Promise<Array<{
 }>> {
   await ensureRecordsDir();
 
-  const files = await fs.readdir(RECORDS_DIR);
+  const dateDirs = await fs.readdir(RECORDS_DIR);
   const pending: Array<{
     recordId: string;
     timestamp: string;
     toolCalls: Array<{ call_id: string; name: string; arguments: string }>;
   }> = [];
 
-  for (const file of files) {
-    if (!file.endsWith(".json")) continue;
-    try {
-      const content = await fs.readFile(path.join(RECORDS_DIR, file), "utf-8");
-      const record = JSON.parse(content) as RequestRecord;
+  for (const dateDir of dateDirs) {
+    const datePath = path.join(RECORDS_DIR, dateDir);
+    const stat = await fs.stat(datePath).catch(() => null);
+    if (!stat || !stat.isDirectory()) continue;
 
-      // Check if this record has tool calls that need execution
-      if (record.toolCalls && record.toolCalls.length > 0) {
-        pending.push({
-          recordId: record.id,
-          timestamp: record.timestamp,
-          toolCalls: record.toolCalls,
-        });
-      }
-    } catch {}
+    const files = await fs.readdir(datePath);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const content = await fs.readFile(path.join(datePath, file), "utf-8");
+        const record = JSON.parse(content) as RequestRecord;
+
+        if (record.toolCalls && record.toolCalls.length > 0) {
+          pending.push({
+            recordId: record.id,
+            timestamp: record.timestamp,
+            toolCalls: record.toolCalls,
+          });
+        }
+      } catch {}
+    }
   }
 
   return pending.sort((a, b) => b.timestamp.localeCompare(a.timestamp));

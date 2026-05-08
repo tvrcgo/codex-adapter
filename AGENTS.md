@@ -1,4 +1,4 @@
-# codex-adapter
+﻿# codex-adapter
 
 这是项目把 codex desktop app 的 responses 格式请求转换成 chat completions 格式，是一个协议的适配层，以便 codex desktop app 可以使用 chat completions 格式的 API。
 

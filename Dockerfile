@@ -1,4 +1,4 @@
-FROM node:22-alpine AS builder
+﻿FROM node:22-alpine AS builder
 WORKDIR /app
 COPY package.json ./
 RUN npm install
@@ -7,6 +7,8 @@ COPY src/ src/
 RUN npm run build
 
 FROM node:22-alpine
+ENV TZ=Asia/Shanghai
+RUN apk add --no-cache tzdata
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
