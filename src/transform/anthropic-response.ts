@@ -25,6 +25,7 @@ interface ActiveToolCall {
   id: string;
   name: string;
   arguments: string;
+  headerEmitted: boolean;
 }
 
 /**
@@ -100,6 +101,22 @@ export class AnthropicResponseWriter {
     }
 
     for (const [, tc] of this.activeToolCalls) {
+      // Flush any tool calls whose header was never emitted (name never arrived)
+      if (!tc.headerEmitted) {
+        this.emitContentBlockStart(tc.index, {
+          type: "tool_use",
+          id: tc.id,
+          name: tc.name || "unknown",
+          input: {},
+        });
+        if (tc.arguments) {
+          this.sendEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: tc.index,
+            delta: { type: "input_json_delta", partial_json: tc.arguments },
+          });
+        }
+      }
       this.emitContentBlockStop(tc.index);
     }
 
@@ -162,6 +179,7 @@ export class AnthropicResponseWriter {
     const tcKey = tc.index;
 
     if (!this.activeToolCalls.has(tcKey)) {
+      // Close thinking/text blocks when entering tool_use territory
       if (this.thinkingBlockIndex >= 0) {
         this.emitContentBlockStop(this.thinkingBlockIndex);
         this.thinkingBlockIndex = -1;
@@ -179,26 +197,47 @@ export class AnthropicResponseWriter {
         id,
         name,
         arguments: "",
-      });
-
-      this.emitContentBlockStart(blockIdx, {
-        type: "tool_use",
-        id,
-        name,
-        input: {},
+        headerEmitted: false,
       });
     }
 
     const active = this.activeToolCalls.get(tcKey)!;
-    if (tc.function?.arguments) {
-      active.arguments += tc.function.arguments;
+
+    if (tc.id && active.id !== tc.id) {
+      active.id = tc.id;
     }
 
-    this.sendEvent("content_block_delta", {
-      type: "content_block_delta",
-      index: active.index,
-      delta: { type: "input_json_delta", partial_json: tc.function?.arguments || "" },
-    });
+    // When name arrives, emit header and flush buffered arguments
+    if (tc.function?.name && !active.headerEmitted) {
+      active.name = tc.function.name;
+      this.emitContentBlockStart(active.index, {
+        type: "tool_use",
+        id: active.id,
+        name: active.name,
+        input: {},
+      });
+      active.headerEmitted = true;
+
+      if (active.arguments) {
+        this.sendEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: active.index,
+          delta: { type: "input_json_delta", partial_json: active.arguments },
+        });
+      }
+    }
+
+    if (tc.function?.arguments) {
+      active.arguments += tc.function.arguments;
+
+      if (active.headerEmitted) {
+        this.sendEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: active.index,
+          delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+        });
+      }
+    }
   }
 
   private emitContentBlockStart(index: number, block: AnthropicContentBlock): void {

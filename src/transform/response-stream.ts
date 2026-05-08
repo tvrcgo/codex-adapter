@@ -667,12 +667,12 @@ export class ResponseStreamWriter {
   private handleToolCallDelta(tc: ChatChunkToolCall): void {
     let active = this.activeToolCalls.get(tc.index);
 
-    // Create active tool call if we have either id or function.name
-    // (some backends send name before id, or omit id entirely)
-    if (!active && (tc.id || tc.function?.name)) {
+    // Create active entry on ANY tool_call field (id, name, or arguments).
+    // Some backends send arguments before name; we buffer until name arrives.
+    if (!active && (tc.id || tc.function?.name || tc.function?.arguments != null)) {
       const callId = tc.id ?? genCallId();
       const name = tc.function?.name ?? "";
-      logger.info(`[handleToolCallDelta] New tool call: index=${tc.index} id=${callId} name=${name}`);
+      logger.info(`[handleToolCallDelta] New tool call: index=${tc.index} id=${callId} name=${name || "(pending)"}`);
       active = {
         index: tc.index,
         itemId: genItemId(),
@@ -690,32 +690,41 @@ export class ResponseStreamWriter {
       return;
     }
 
-    // Update id if it arrives in a later delta
     if (tc.id && active.callId !== tc.id) {
       active.callId = tc.id;
     }
 
+    // When name arrives, emit header and flush any buffered arguments
     if (tc.function?.name && !active.headerEmitted) {
       active.name = tc.function.name;
       this.emitToolCallHeader(active);
       active.headerEmitted = true;
+
+      if (active.arguments) {
+        sendEvent(this.res, "response.function_call_arguments.delta", {
+          type: "response.function_call_arguments.delta",
+          item_id: active.itemId,
+          output_index: active.outputIndex,
+          call_id: active.callId,
+          delta: active.arguments,
+        });
+      }
     }
 
     if (tc.function?.arguments) {
       active.arguments += tc.function.arguments;
 
-      if (!active.headerEmitted) {
-        this.emitToolCallHeader(active);
-        active.headerEmitted = true;
+      // If header already emitted, send delta immediately;
+      // otherwise arguments are buffered until name arrives.
+      if (active.headerEmitted) {
+        sendEvent(this.res, "response.function_call_arguments.delta", {
+          type: "response.function_call_arguments.delta",
+          item_id: active.itemId,
+          output_index: active.outputIndex,
+          call_id: active.callId,
+          delta: tc.function.arguments,
+        });
       }
-
-      sendEvent(this.res, "response.function_call_arguments.delta", {
-        type: "response.function_call_arguments.delta",
-        item_id: active.itemId,
-        output_index: active.outputIndex,
-        call_id: active.callId,
-        delta: tc.function.arguments,
-      });
     }
   }
 
@@ -742,6 +751,10 @@ export class ResponseStreamWriter {
     this.activeToolCalls.clear();
 
     for (const active of calls) {
+      // Flush header if never emitted (name arrived late or never)
+      if (!active.headerEmitted) {
+        this.emitToolCallHeader(active);
+      }
       const safeArgs = ResponseStreamWriter.sanitizeArguments(active.arguments);
 
       sendEvent(this.res, "response.function_call_arguments.done", {
