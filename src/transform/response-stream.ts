@@ -455,33 +455,7 @@ export class ResponseStreamWriter {
     const outputIndex = this.nextOutputIndex++;
     const argsStr = JSON.stringify(call.arguments);
 
-    // Emit output_item.added with function_call header
-    const item: ResponseFunctionCallItem = {
-      id: itemId,
-      type: "function_call",
-      call_id: callId,
-      name: call.name,
-      arguments: "",
-      status: "in_progress",
-    };
-
-    sendEvent(this.res, "response.output_item.added", {
-      type: "response.output_item.added",
-      output_index: outputIndex,
-      item,
-    });
-
-    // Emit arguments delta
-    sendEvent(this.res, "response.function_call_arguments.delta", {
-      type: "response.function_call_arguments.delta",
-      item_id: itemId,
-      output_index: outputIndex,
-      call_id: callId,
-      delta: argsStr,
-    });
-
-    // Track as active tool call for finalize/closeAllToolCalls
-    this.activeToolCalls.set(tcIndex, {
+    const active: ActiveToolCall = {
       index: tcIndex,
       itemId,
       callId,
@@ -489,7 +463,16 @@ export class ResponseStreamWriter {
       arguments: argsStr,
       outputIndex,
       headerEmitted: true,
-    });
+    };
+
+    // header (output_item.added + output_tool_call.begin)
+    this.emitToolCallHeader(active);
+
+    // delta (both legacy + modern)
+    this.emitToolCallArgumentsDelta(active, argsStr);
+
+    // Track for finalize/closeAllToolCalls
+    this.activeToolCalls.set(tcIndex, active);
 
     logger.info(`[XML->function_call] name=${call.name} args=${argsStr.slice(0, 100)}`);
   }
@@ -703,13 +686,7 @@ export class ResponseStreamWriter {
       active.headerEmitted = true;
 
       if (active.arguments) {
-        sendEvent(this.res, "response.function_call_arguments.delta", {
-          type: "response.function_call_arguments.delta",
-          item_id: active.itemId,
-          output_index: active.outputIndex,
-          call_id: active.callId,
-          delta: active.arguments,
-        });
+        this.emitToolCallArgumentsDelta(active, active.arguments);
       }
     }
 
@@ -719,15 +696,30 @@ export class ResponseStreamWriter {
       // If header already emitted, send delta immediately;
       // otherwise arguments are buffered until name arrives.
       if (active.headerEmitted) {
-        sendEvent(this.res, "response.function_call_arguments.delta", {
-          type: "response.function_call_arguments.delta",
-          item_id: active.itemId,
-          output_index: active.outputIndex,
-          call_id: active.callId,
-          delta: tc.function.arguments,
-        });
+        this.emitToolCallArgumentsDelta(active, tc.function.arguments);
       }
     }
+  }
+
+  /** Emit both legacy and modern argument delta events. */
+  private emitToolCallArgumentsDelta(active: ActiveToolCall, delta: string): void {
+    // Legacy: function_call_arguments.delta
+    sendEvent(this.res, "response.function_call_arguments.delta", {
+      type: "response.function_call_arguments.delta",
+      item_id: active.itemId,
+      output_index: active.outputIndex,
+      call_id: active.callId,
+      delta,
+    });
+
+    // Modern: output_tool_call.delta
+    sendEvent(this.res, "response.output_tool_call.delta", {
+      type: "response.output_tool_call.delta",
+      output_index: active.outputIndex,
+      item_id: active.itemId,
+      call_id: active.callId,
+      delta,
+    });
   }
 
   private emitToolCallHeader(active: ActiveToolCall): void {
@@ -745,6 +737,15 @@ export class ResponseStreamWriter {
       output_index: active.outputIndex,
       item,
     });
+
+    // Modern: output_tool_call.begin
+    sendEvent(this.res, "response.output_tool_call.begin", {
+      type: "response.output_tool_call.begin",
+      output_index: active.outputIndex,
+      item_id: active.itemId,
+      call_id: active.callId,
+      name: active.name,
+    });
   }
 
   private closeAllToolCalls(): void {
@@ -759,11 +760,22 @@ export class ResponseStreamWriter {
       }
       const safeArgs = ResponseStreamWriter.sanitizeArguments(active.arguments);
 
+      // Legacy: function_call_arguments.done
       sendEvent(this.res, "response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         item_id: active.itemId,
         output_index: active.outputIndex,
         call_id: active.callId,
+        arguments: safeArgs,
+      });
+
+      // Modern: output_tool_call.done
+      sendEvent(this.res, "response.output_tool_call.done", {
+        type: "response.output_tool_call.done",
+        output_index: active.outputIndex,
+        item_id: active.itemId,
+        call_id: active.callId,
+        name: active.name,
         arguments: safeArgs,
       });
 
