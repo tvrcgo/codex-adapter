@@ -48,6 +48,8 @@ export type FetchBackendResult =
   | { ok: true; response: globalThis.Response }
   | { ok: false; status?: number; message: string };
 
+const BACKEND_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
 /** POST to backend with structured result. Handles connection errors and non-OK HTTP responses. */
 export async function fetchBackend(
   url: string,
@@ -61,6 +63,7 @@ export async function fetchBackend(
       method: "POST",
       headers,
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(BACKEND_TIMEOUT_MS),
     });
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
