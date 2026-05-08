@@ -297,11 +297,10 @@ export class ResponseStreamWriter {
   // ������ Content delta with XML tool call detection ������
 
   /**
-   * Handle content delta: detect XML-style tool calls from backends
-   * that output tool calls as text (e.g., GLM-5/WPS) and convert them
-   * to proper function_call events.
-   * Also filters out thinking content using a state machine that tracks
-   * whether we're inside a thinking block, even when tags don't close properly.
+   * Handle content delta: detect XML-style tool calls from backends that
+   * output tool calls as text (e.g., Hermes/Llama via vLLM, or models
+   * prompted with OpenAI XML format) and convert them to function_call events.
+   * Also filters out thinking content via a state machine.
    */
   private handleContentDelta(content: string): void {
     this.xmlContentBuffer += content;
@@ -495,54 +494,63 @@ export class ResponseStreamWriter {
     logger.info(`[XML->function_call] name=${call.name} args=${argsStr.slice(0, 100)}`);
   }
 
-  /** Extract complete XML tool calls from content. Returns null if no complete pattern found. */
+  /**
+   * Extract complete XML tool calls from content.
+   *
+   * Supported formats:
+   * - Hermes: <tool_call>{"name":"func","arguments":{...}}</tool_call>
+   *   Also accepts "parameters" as alias for "arguments".
+   * - OpenAI XML: <function=name><parameter=key>value</parameter></function>
+   */
   private extractXmlToolCalls(content: string): {
     calls: Array<{ name: string; arguments: Record<string, unknown> }>;
     remaining: string;
     textBefore: string;
   } | null {
     const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
-
-    // Pattern 1: <command>JSON array</command> (GLM-5/WPS format)
-    // e.g. <command>["powershell.exe", "-Command", "rg -n 'dir=' D:\\Code\\wpsweb --type html"]</command>
-    const commandTagRegex = /<command>\s*([\s\S]*?)\s*<\/command>/g;
-    let match: RegExpExecArray | null;
     let firstMatchStart = -1;
     let lastMatchEnd = 0;
 
-    while ((match = commandTagRegex.exec(content)) !== null) {
+    // Pattern 1: Hermes — <tool_call>JSON</tool_call>
+    const hermesRegex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = hermesRegex.exec(content)) !== null) {
       if (firstMatchStart === -1) firstMatchStart = match.index;
       lastMatchEnd = match.index + match[0].length;
 
-      const inner = match[1].trim();
       try {
-        const parsed = JSON.parse(inner);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const cmd = String(parsed[0]);
-          const args = parsed.slice(1).map((a: unknown) => String(a));
-          calls.push({
-            name: "shell",
-            arguments: { command: cmd, args },
-          });
-        } else {
-          calls.push({ name: "shell", arguments: { command: inner } });
+        const parsed = JSON.parse(match[1].trim());
+        const name = parsed.name ?? parsed.function ?? "";
+        const args = parsed.arguments ?? parsed.parameters ?? {};
+        if (name) {
+          calls.push({ name, arguments: typeof args === "object" ? args : {} });
         }
       } catch {
-        calls.push({ name: "shell", arguments: { command: inner } });
+        logger.warn(`[extractXmlToolCalls] Failed to parse Hermes JSON: ${match[1].slice(0, 200)}`);
       }
     }
 
-    // Pattern 2: <execute>command</execute>
+    // Pattern 2: OpenAI XML — <function=name>...<parameter=key>value</parameter>...</function>
     if (calls.length === 0) {
-      const executeTagRegex = /<execute>\s*([\s\S]*?)\s*<\/execute>/g;
-      while ((match = executeTagRegex.exec(content)) !== null) {
+      const funcRegex = /<function=([^>]+)>([\s\S]*?)<\/function>/g;
+      const paramRegex = /<parameter=([^>]+)>([\s\S]*?)<\/parameter>/g;
+
+      while ((match = funcRegex.exec(content)) !== null) {
         if (firstMatchStart === -1) firstMatchStart = match.index;
         lastMatchEnd = match.index + match[0].length;
 
-        calls.push({
-          name: "shell",
-          arguments: { command: match[1].trim() },
-        });
+        const name = match[1].trim();
+        const body = match[2];
+        const args: Record<string, unknown> = {};
+
+        let paramMatch: RegExpExecArray | null;
+        paramRegex.lastIndex = 0;
+        while ((paramMatch = paramRegex.exec(body)) !== null) {
+          args[paramMatch[1].trim()] = paramMatch[2];
+        }
+
+        calls.push({ name, arguments: args });
       }
     }
 
@@ -559,22 +567,16 @@ export class ResponseStreamWriter {
     const trimmed = content.trimEnd();
     if (!trimmed) return false;
 
-    // Note: thinking tag detection is now handled by processThinkingState() state machine
+    // Incomplete opening tag
+    if (/<[a-z_]*$/i.test(trimmed)) return true;
+    if (/<tool_call[^>]*$/i.test(trimmed)) return true;
+    if (/<function=[^>]*$/i.test(trimmed)) return true;
 
-    // Incomplete opening tag (generic)
-    if (/<[a-z]*$/i.test(trimmed)) return true;
-    if (/<command[^>]*$/i.test(trimmed)) return true;
-    if (/<execute[^>]*$/i.test(trimmed)) return true;
+    // Opened but not yet closed
+    if (/<tool_call[^>]*>/.test(trimmed) && !trimmed.includes("</tool_call>")) return true;
+    if (/<function=[^>]+>/.test(trimmed) && !trimmed.includes("</function>")) return true;
 
-    // Opened tag but not yet closed
-    const openCmd = trimmed.match(/<command[^>]*>/);
-    if (openCmd && !trimmed.includes("</command>")) return true;
-
-    const openExec = trimmed.match(/<execute[^>]*>/);
-    if (openExec && !trimmed.includes("</execute>")) return true;
-
-    // Don't buffer too long without finding a pattern
-    if (trimmed.length > 500) return false;
+    if (trimmed.length > 2000) return false;
 
     return false;
   }
