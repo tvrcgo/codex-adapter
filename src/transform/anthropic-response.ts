@@ -29,31 +29,37 @@ interface ActiveToolCall {
 
 /**
  * Transform Chat Completions stream to Anthropic Messages stream format.
+ *
+ * Handles backends that use reasoning_content (thinking) + content (response):
+ * - reasoning_content → Anthropic "thinking" content block
+ * - content → Anthropic "text" content block
  */
 export class AnthropicResponseWriter {
   private res: Response;
   private model: string;
   private messageId: string;
+  private thinkingEnabled: boolean;
   private messageStarted: boolean = false;
+  private thinkingBlockIndex: number = -1;
   private contentBlockIndex: number = -1;
+  private nextBlockIndex: number = 0;
   private activeToolCalls: Map<number, ActiveToolCall> = new Map();
   private inputTokens: number = 0;
   private outputTokens: number = 0;
 
-  constructor(res: Response, model: string) {
+  constructor(res: Response, model: string, thinkingEnabled: boolean = false) {
     this.res = res;
     this.model = model;
+    this.thinkingEnabled = thinkingEnabled;
     this.messageId = genMsgId();
   }
 
   processChunk(chunk: ChatCompletionChunk): void {
-    // Update usage info
     if (chunk.usage) {
       this.inputTokens = Math.max(this.inputTokens, chunk.usage.prompt_tokens ?? 0);
       this.outputTokens = chunk.usage.completion_tokens ?? 0;
     }
 
-    // Emit message_start on first chunk
     if (!this.messageStarted) {
       this.emitMessageStart();
       this.messageStarted = true;
@@ -64,6 +70,11 @@ export class AnthropicResponseWriter {
     for (const choice of chunk.choices) {
       const delta = choice.delta;
       if (!delta) continue;
+
+      const rc = (delta as { reasoning_content?: string }).reasoning_content;
+      if (rc && this.thinkingEnabled) {
+        this.handleThinkingDelta(rc);
+      }
 
       if (delta.content != null && delta.content !== "") {
         this.handleTextDelta(delta.content);
@@ -83,20 +94,20 @@ export class AnthropicResponseWriter {
       this.messageStarted = true;
     }
 
-    // Close any open tool calls
-    for (const [index, tc] of this.activeToolCalls) {
-      this.emitContentBlockStop(index);
+    if (this.thinkingBlockIndex >= 0) {
+      this.emitContentBlockStop(this.thinkingBlockIndex);
+      this.thinkingBlockIndex = -1;
     }
 
-    // Close text block if open
-    if (this.contentBlockIndex >= 0 && !this.activeToolCalls.has(this.contentBlockIndex)) {
+    for (const [, tc] of this.activeToolCalls) {
+      this.emitContentBlockStop(tc.index);
+    }
+
+    if (this.contentBlockIndex >= 0) {
       this.emitContentBlockStop(this.contentBlockIndex);
     }
 
-    // Emit message_delta with stop_reason
     this.emitMessageDelta();
-
-    // Emit message_stop
     this.emitMessageStop();
   }
 
@@ -115,9 +126,28 @@ export class AnthropicResponseWriter {
     this.sendEvent("message_start", { type: "message_start", message });
   }
 
+  private handleThinkingDelta(thinking: string): void {
+    if (this.thinkingBlockIndex < 0) {
+      this.thinkingBlockIndex = this.nextBlockIndex++;
+      this.emitContentBlockStart(this.thinkingBlockIndex, { type: "thinking", thinking: "" });
+    }
+
+    this.sendEvent("content_block_delta", {
+      type: "content_block_delta",
+      index: this.thinkingBlockIndex,
+      delta: { type: "thinking_delta", thinking },
+    });
+  }
+
   private handleTextDelta(text: string): void {
+    // Close thinking block when actual content starts
+    if (this.thinkingBlockIndex >= 0) {
+      this.emitContentBlockStop(this.thinkingBlockIndex);
+      this.thinkingBlockIndex = -1;
+    }
+
     if (this.contentBlockIndex < 0) {
-      this.contentBlockIndex = this.activeToolCalls.size;
+      this.contentBlockIndex = this.nextBlockIndex++;
       this.emitContentBlockStart(this.contentBlockIndex, { type: "text", text: "" });
     }
 
@@ -129,25 +159,29 @@ export class AnthropicResponseWriter {
   }
 
   private handleToolCallDelta(tc: ChatChunkToolCall): void {
-    const index = tc.index;
+    const tcKey = tc.index;
 
-    if (!this.activeToolCalls.has(index)) {
-      // Close text block before starting tool call
+    if (!this.activeToolCalls.has(tcKey)) {
+      if (this.thinkingBlockIndex >= 0) {
+        this.emitContentBlockStop(this.thinkingBlockIndex);
+        this.thinkingBlockIndex = -1;
+      }
       if (this.contentBlockIndex >= 0) {
         this.emitContentBlockStop(this.contentBlockIndex);
         this.contentBlockIndex = -1;
       }
 
+      const blockIdx = this.nextBlockIndex++;
       const id = tc.id || genToolUseId();
       const name = tc.function?.name || "";
-      this.activeToolCalls.set(index, {
-        index,
+      this.activeToolCalls.set(tcKey, {
+        index: blockIdx,
         id,
         name,
         arguments: "",
       });
 
-      this.emitContentBlockStart(index, {
+      this.emitContentBlockStart(blockIdx, {
         type: "tool_use",
         id,
         name,
@@ -155,14 +189,14 @@ export class AnthropicResponseWriter {
       });
     }
 
-    const active = this.activeToolCalls.get(index)!;
+    const active = this.activeToolCalls.get(tcKey)!;
     if (tc.function?.arguments) {
       active.arguments += tc.function.arguments;
     }
 
     this.sendEvent("content_block_delta", {
       type: "content_block_delta",
-      index,
+      index: active.index,
       delta: { type: "input_json_delta", partial_json: tc.function?.arguments || "" },
     });
   }
@@ -183,9 +217,10 @@ export class AnthropicResponseWriter {
   }
 
   private emitMessageDelta(): void {
+    const stopReason = this.activeToolCalls.size > 0 ? "tool_use" : "end_turn";
     this.sendEvent("message_delta", {
       type: "message_delta",
-      delta: { stop_reason: "end_turn", stop_sequence: null },
+      delta: { stop_reason: stopReason, stop_sequence: null },
       usage: { output_tokens: this.outputTokens },
     });
   }

@@ -8,6 +8,7 @@ import type {
   ResponsesContentPart,
   ChatCompletionsRequest,
   ChatMessage,
+  ChatUserMessage,
   ChatUserContentPart,
   ChatAssistantMessage,
   ChatToolCall,
@@ -15,6 +16,35 @@ import type {
 } from "./types.js";
 import { convertTools, convertToolChoice } from "./tools.js";
 import { getCachedReasoning, makeReasoningKey } from "../utils/reasoning-cache.js";
+import { logger } from "../utils/logger.js";
+
+const IMAGE_TAG_RE = /<\/?image>/gi;
+
+/**
+ * Strip image_url parts from user messages and collapse to plain text.
+ * Text-only backends (GLM-5) reject image_url with "模型推理异常".
+ */
+function stripImageContent(messages: ChatMessage[]): void {
+  for (const msg of messages) {
+    if (msg.role !== "user") continue;
+    const um = msg as ChatUserMessage;
+    if (typeof um.content === "string") continue;
+    if (!Array.isArray(um.content)) continue;
+
+    const hasImage = um.content.some(p => p.type === "image_url");
+    if (!hasImage) continue;
+
+    // Keep only text parts, drop image_url and <image>/<image> markers
+    const text = um.content
+      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      .map(p => p.text)
+      .join("")
+      .replace(IMAGE_TAG_RE, "")
+      .trim();
+
+    um.content = text || "[image]";
+  }
+}
 
 export function transformRequest(
   body: ResponsesRequest,
@@ -23,9 +53,35 @@ export function transformRequest(
   let messages = buildMessages(body);
   messages = validateMessageSequence(messages);
 
+  // Strip image content — text-only backends (e.g. GLM-5) reject image_url parts
+  // with "模型推理异常". Convert array content to plain text, dropping images and
+  // their <image></image> markers.
+  stripImageContent(messages);
+
   for (const msg of messages) {
     if (msg.role === "assistant") {
       const aMsg = msg as ChatAssistantMessage;
+
+      if (aMsg.content === null || aMsg.content === undefined) {
+        aMsg.content = "";
+      }
+
+      // Sanitize malformed tool_call arguments (defense-in-depth).
+      // Primary protection is in response-stream.ts; this catches edge cases
+      // where malformed args somehow entered the conversation history.
+      if (aMsg.tool_calls) {
+        for (const tc of aMsg.tool_calls) {
+          try {
+            JSON.parse(tc.function.arguments);
+          } catch {
+            logger.warn(
+              `[request] Malformed tool_call arguments in history for ${tc.function.name}, normalizing to {}`
+            );
+            tc.function.arguments = "{}";
+          }
+        }
+      }
+
       const toolCallIds = aMsg.tool_calls?.map(tc => tc.id);
       const key = makeReasoningKey(aMsg.content, toolCallIds);
       const reasoning = getCachedReasoning(key);
@@ -99,10 +155,17 @@ function buildMessages(body: ResponsesRequest): ChatMessage[] {
 
         while (i < items.length && isFunctionCallItem(items[i])) {
           const fc = items[i] as ResponsesFunctionCallItem;
+          let args = fc.arguments;
+          try {
+            JSON.parse(args);
+          } catch {
+            logger.warn(`[request] Malformed function_call arguments from client for ${fc.name}, normalizing to {}`);
+            args = "{}";
+          }
           toolCalls.push({
             id: fc.call_id,
             type: "function",
-            function: { name: fc.name, arguments: fc.arguments },
+            function: { name: fc.name, arguments: args },
           });
           i++;
         }
@@ -330,7 +393,77 @@ export function compressToolMessages(
     if (estimateTokens(chatReq.messages) + estimateToolTokens(chatReq.tools) <= threshold) break;
   }
 
+  // Compression removes tool_calls and tool messages, which can create
+  // consecutive assistant messages. Merge them to avoid backend rejection.
+  if (compressedCount > 0) {
+    mergeConsecutiveAssistants(chatReq.messages);
+  }
+
   return { compressed: compressedCount > 0, rounds: compressedCount };
+}
+
+/**
+ * Trim messages to keep serialized body under maxBytes.
+ * Strategy: keep system + first user message + most recent messages.
+ * This preserves a valid message sequence (system → user → ...) and keeps
+ * recent context intact — critical because modifying message content or
+ * removing from the middle causes higher backend failure rates.
+ */
+export function trimByBodySize(
+  chatReq: ChatCompletionsRequest,
+  maxBytes: number,
+): { trimmed: boolean; removedTurns: number } {
+  let bodySize = JSON.stringify(chatReq).length;
+  if (bodySize <= maxBytes) return { trimmed: false, removedTurns: 0 };
+
+  const msgs = chatReq.messages;
+
+  // Find the first user message to protect (system + first user = conversation start)
+  let firstUserEnd = 1;
+  for (let i = 1; i < msgs.length; i++) {
+    if (msgs[i].role === "user") {
+      firstUserEnd = i + 1;
+      break;
+    }
+  }
+
+  const head = msgs.slice(0, firstUserEnd);
+  let tail = msgs.slice(firstUserEnd);
+
+  // Remove from the front of 'tail' (oldest non-protected messages) until under limit
+  let removedTurns = 0;
+  while (tail.length > 0) {
+    const testReq = { ...chatReq, messages: [...head, ...tail] };
+    bodySize = JSON.stringify(testReq).length;
+    if (bodySize <= maxBytes) break;
+
+    // Remove one turn from the beginning of tail
+    const m = tail[0];
+    if (m.role === "assistant" && "tool_calls" in m && m.tool_calls?.length) {
+      // Remove assistant + all its tool responses
+      const callIds = new Set(m.tool_calls.map(tc => tc.id));
+      let endIdx = 1;
+      while (endIdx < tail.length && tail[endIdx].role === "tool" &&
+             "tool_call_id" in tail[endIdx] && callIds.has((tail[endIdx] as { tool_call_id: string }).tool_call_id)) {
+        endIdx++;
+      }
+      tail = tail.slice(endIdx);
+    } else {
+      tail = tail.slice(1);
+    }
+    removedTurns++;
+  }
+
+  // Ensure tail starts at a valid boundary (not an orphaned tool message)
+  while (tail.length > 0 && tail[0].role === "tool") {
+    tail = tail.slice(1);
+  }
+
+  if (removedTurns > 0) {
+    chatReq.messages = [...head, ...tail];
+  }
+
+  return { trimmed: removedTurns > 0, removedTurns };
 }
 
 interface ToolRound {
@@ -403,6 +536,42 @@ function compressRound(messages: ChatMessage[], round: ToolRound): void {
   const sortedIndices = [...round.toolIndices].sort((a, b) => b - a);
   for (const idx of sortedIndices) {
     messages.splice(idx, 1);
+  }
+}
+
+/**
+ * Merge consecutive assistant messages in-place.
+ * Backends like GLM-5 reject requests with consecutive same-role messages.
+ */
+function mergeConsecutiveAssistants(messages: ChatMessage[]): void {
+  let i = 0;
+  while (i < messages.length - 1) {
+    const cur = messages[i];
+    const next = messages[i + 1];
+    if (cur.role === "assistant" && next.role === "assistant") {
+      const a = cur as ChatAssistantMessage;
+      const b = next as ChatAssistantMessage;
+
+      // Merge content
+      const aPart = a.content ?? "";
+      const bPart = b.content ?? "";
+      a.content = aPart && bPart ? aPart + "\n" + bPart : aPart || bPart || null;
+
+      // Merge tool_calls
+      if (b.tool_calls?.length) {
+        a.tool_calls = [...(a.tool_calls ?? []), ...b.tool_calls];
+      }
+
+      // Merge reasoning_content
+      if (b.reasoning_content && !a.reasoning_content) {
+        a.reasoning_content = b.reasoning_content;
+      }
+
+      messages.splice(i + 1, 1);
+      // Don't increment i — check the merged result against the next message
+    } else {
+      i++;
+    }
   }
 }
 

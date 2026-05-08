@@ -12,6 +12,7 @@ export interface AnthropicMessagesRequest {
   tools?: AnthropicTool[];
   tool_choice?: AnthropicToolChoice;
   stop_sequences?: string[];
+  thinking?: { type: string; budget_tokens?: number };
   metadata?: { user_id?: string };
 }
 
@@ -31,9 +32,15 @@ export interface AnthropicAssistantMessage {
 
 export type AnthropicContentBlock =
   | AnthropicTextBlock
+  | AnthropicThinkingBlock
   | AnthropicImageBlock
   | AnthropicToolUseBlock
   | AnthropicToolResultBlock;
+
+export interface AnthropicThinkingBlock {
+  type: "thinking";
+  thinking: string;
+}
 
 export interface AnthropicTextBlock {
   type: "text";

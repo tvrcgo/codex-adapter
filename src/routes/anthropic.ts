@@ -170,7 +170,8 @@ async function handleAnthropicMessages(
     return;
   }
 
-  const writer = new AnthropicResponseWriter(res, body.model);
+  const thinkingEnabled = body.thinking?.type === "enabled";
+  const writer = new AnthropicResponseWriter(res, body.model, thinkingEnabled);
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -181,7 +182,7 @@ async function handleAnthropicMessages(
       const { done, value } = await reader.read();
       if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
       const { events, remaining } = parseSSEBuffer(buffer);
       buffer = remaining;
 
@@ -192,16 +193,28 @@ async function handleAnthropicMessages(
         let chunk: ChatCompletionChunk;
         try {
           chunk = JSON.parse(data) as ChatCompletionChunk;
-        } catch {
+        } catch (parseErr) {
+          logger.warn(`[A${rid}] Failed to parse SSE chunk JSON (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
           continue;
         }
 
-        // Debug log for usage
-        if (chunk.usage) {
-          logger.debug(`[A${rid}] Backend usage: ${JSON.stringify(chunk.usage)}`);
+        chunkCount++;
+
+        // Log first few chunks and any with content for debugging
+        if (chunkCount <= 3 || chunkCount % 100 === 0) {
+          logger.debug(`[A${rid}] chunk#${chunkCount}: ${JSON.stringify(chunk).slice(0, 300)}`);
         }
 
-        chunkCount++;
+        const delta = chunk.choices?.[0]?.delta;
+        if (delta) {
+          const rc = (delta as Record<string, unknown>).reasoning_content;
+          if (rc && !delta.content) {
+            if (chunkCount <= 3) {
+              logger.info(`[A${rid}] Backend sends reasoning_content instead of content`);
+            }
+          }
+        }
+
         writer.processChunk(chunk);
       }
     }

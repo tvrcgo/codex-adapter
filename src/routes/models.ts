@@ -14,7 +14,10 @@ export function createModelsRouter(config: AdapterConfig): Router {
         type: "model",
         display_name: m.includes("/") ? m.split("/").pop()! : m,
         created_at: new Date().toISOString(),
-        ...(b.maxTokens ? { max_input_tokens: b.maxTokens } : {}),
+        ...(b.maxTokens ? {
+          max_input_tokens: b.maxTokens,
+          context_window: b.maxTokens,
+        } : {}),
       })),
     );
 

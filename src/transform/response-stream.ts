@@ -770,12 +770,14 @@ export class ResponseStreamWriter {
     this.activeToolCalls.clear();
 
     for (const active of calls) {
+      const safeArgs = ResponseStreamWriter.sanitizeArguments(active.arguments);
+
       sendEvent(this.res, "response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         item_id: active.itemId,
         output_index: active.outputIndex,
         call_id: active.callId,
-        arguments: active.arguments,
+        arguments: safeArgs,
       });
 
       sendEvent(this.res, "response.output_item.done", {
@@ -786,10 +788,28 @@ export class ResponseStreamWriter {
           type: "function_call",
           call_id: active.callId,
           name: active.name,
-          arguments: active.arguments,
+          arguments: safeArgs,
           status: "completed",
         },
       });
+    }
+  }
+
+  /**
+   * Validate tool_call arguments JSON. If malformed, normalize to valid JSON
+   * so the client never accumulates invalid JSON in conversation history.
+   * This mirrors what wps-claude-code does with `safeParseJSON(args) ?? {}`.
+   */
+  private static sanitizeArguments(raw: string): string {
+    if (!raw || raw === "{}") return raw || "{}";
+    try {
+      JSON.parse(raw);
+      return raw;
+    } catch {
+      logger.warn(
+        `Malformed tool_call arguments detected (${raw.length} chars), normalizing to {}. Preview: ${raw.slice(0, 200)}`
+      );
+      return "{}";
     }
   }
 
@@ -853,7 +873,7 @@ export class ResponseStreamWriter {
         type: "function_call",
         call_id: active.callId,
         name: active.name,
-        arguments: active.arguments,
+        arguments: ResponseStreamWriter.sanitizeArguments(active.arguments),
         status: "completed",
       });
     }

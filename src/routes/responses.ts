@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import type { AdapterConfig } from "../config.js";
 import { resolveBackend } from "../config.js";
 import type { ResponsesRequest, ChatCompletionChunk, ChatCompletionsRequest } from "../transform/types.js";
-import { transformRequest, estimateTokens, estimateToolTokens, compressToolMessages } from "../transform/request.js";
+import { transformRequest, estimateTokens, estimateToolTokens } from "../transform/request.js";
 import { ResponseStreamWriter } from "../transform/response-stream.js";
 import { initSSE, parseSSEBuffer } from "../utils/sse.js";
 import { logger } from "../utils/logger.js";
@@ -151,21 +151,6 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     `| max_tokens=${backend.maxTokens ?? "unset"}`
   );
 
-  // --- Compress old tool messages if body too large ---
-  const { compressed, rounds } = compressToolMessages(chatReq, backend.maxTokens);
-  if (compressed) {
-    // Re-estimate after compression for accurate calibration
-    msgEstTokens = estimateTokens(chatReq.messages);
-    toolsEstTokens = estimateToolTokens(chatReq.tools);
-    adapterTotalEst = msgEstTokens + toolsEstTokens;
-
-    const newBodySize = JSON.stringify(chatReq).length;
-    logger.info(
-      `[R${rid}] Compressed ${rounds} old tool rounds → ` +
-      `${chatReq.messages.length} messages, est_tokens=${adapterTotalEst} body=${(newBodySize / 1024).toFixed(0)}KB`
-    );
-  }
-
   // Store calibrated estimate for offset calculation after backend response
   const calibratedEst = getCalibratedEstimate(adapterTotalEst);
 
@@ -238,14 +223,21 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
       break; // Got real content, proceed to stream-through
     }
 
-    // Only retry on empty (stub-reject). All other errors should return immediately.
+    // Retry on empty (stub-reject)
     if (attemptResult.kind === "empty") {
       lastAttempt = attemptResult;
       logger.warn(`[R${rid}] Attempt ${attempt + 1} returned empty (stub-reject), will retry...`);
-      continue; // retry
+      continue;
     }
 
-    // Error case: don't retry, return immediately
+    // Retry on transient backend error (bad_request / 模型推理异常), max 2 retries
+    if (attemptResult.kind === "error" && attemptResult.message.includes("bad_request") && attempt < 2) {
+      lastAttempt = attemptResult;
+      logger.warn(`[R${rid}] Attempt ${attempt + 1} backend inference error, will retry...`);
+      continue;
+    }
+
+    // Other errors or exhausted bad_request retries: return immediately
     lastAttempt = attemptResult;
     break;
   }
@@ -360,7 +352,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
         break;
       }
 
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
       const { events, remaining } = parseSSEBuffer(buffer);
       buffer = remaining;
 
@@ -374,7 +366,8 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
         let chunk: ChatCompletionChunk;
         try {
           chunk = JSON.parse(data) as ChatCompletionChunk;
-        } catch {
+        } catch (parseErr) {
+          logger.warn(`[R${rid}] Failed to parse SSE chunk JSON (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
           continue;
         }
 
@@ -483,7 +476,7 @@ async function fetchAndBufferUntilContent(
       if (done) break;
 
       pendingChunks.push(value);
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
       const { events, remaining } = parseSSEBuffer(buffer);
       buffer = remaining;
 
@@ -494,7 +487,8 @@ async function fetchAndBufferUntilContent(
         let chunk: ChatCompletionChunk;
         try {
           chunk = JSON.parse(data) as ChatCompletionChunk;
-        } catch {
+        } catch (parseErr) {
+          logger.warn(`[R${rid}] Failed to parse SSE chunk JSON in tryOnce (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
           continue;
         }
 
