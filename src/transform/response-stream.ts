@@ -27,15 +27,10 @@ interface ActiveToolCall {
 /**
  * Stateful transformer that receives Chat Completions chunks one at a time
  * and emits Responses API SSE events to the Express response.
- *
- * The `inputTokenOffset` ensures Codex sees conservative token counts:
- *   reported input_tokens = real prompt_tokens + offset
- * This triggers Codex's compaction earlier when approaching context limits.
  */
 export class ResponseStreamWriter {
   private res: Response;
   private model: string;
-  private inputTokenOffset: number;
 
   private responseId: string;
   private created: boolean = false;
@@ -55,24 +50,12 @@ export class ResponseStreamWriter {
   private xmlContentBuffer: string = "";
   private xmlToolCallIndex: number = 1000;
 
-  // Thinking block state machine
-  // Tracks whether we're inside a thinking block to suppress output
-  private inThinkingBlock: boolean = false;
-  private thinkingTagType: string | null = null; // 'millennia', 'think', 'thought'
-  private thinkingBuffer: string = ""; // Accumulate content while in thinking block
-
   private usage: ResponseUsage | null = null;
 
-  constructor(res: Response, model: string, inputTokenOffset: number = 0) {
+  constructor(res: Response, model: string) {
     this.res = res;
     this.model = model;
-    this.inputTokenOffset = inputTokenOffset;
     this.responseId = genResponseId();
-  }
-
-  /** Update the token offset (can be called after backend responds with real prompt_tokens). */
-  setInputTokenOffset(offset: number): void {
-    this.inputTokenOffset = offset;
   }
 
   /** Process a single parsed Chat Completions chunk. */
@@ -124,27 +107,10 @@ export class ResponseStreamWriter {
   finalize(hasContent: boolean = true): void {
     // Flush any remaining XML buffer as text
     if (this.xmlContentBuffer) {
-      // If still in a thinking block at finalize, discard it (unclosed thinking tag)
-      if (this.inThinkingBlock) {
-        logger.info(`[finalize] Discarding unclosed thinking block (${this.thinkingTagType}), ${this.xmlContentBuffer.length} chars buffered`);
-        this.xmlContentBuffer = "";
-        this.inThinkingBlock = false;
-        this.thinkingTagType = null;
-        this.thinkingBuffer = "";
-      } else {
-        // Strip any remaining orphan closing tags
-        this.xmlContentBuffer = this.xmlContentBuffer
-          .replace(/<\/millennia-thinking>/gi, "")
-          .replace(/<\/think>/gi, "")
-          .replace(/<\|end_of_thought\|>/gi, "");
-      }
-
-      if (this.xmlContentBuffer) {
-        const toFlush = this.xmlContentBuffer;
-        this.xmlContentBuffer = "";
-        logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
-        this.handleTextDelta(toFlush);
-      }
+      const toFlush = this.xmlContentBuffer;
+      this.xmlContentBuffer = "";
+      logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
+      this.handleTextDelta(toFlush);
     }
 
 
@@ -300,29 +266,12 @@ export class ResponseStreamWriter {
    * Handle content delta: detect XML-style tool calls from backends that
    * output tool calls as text (e.g., Hermes/Llama via vLLM, or models
    * prompted with OpenAI XML format) and convert them to function_call events.
-   * Also filters out thinking content via a state machine.
    */
   private handleContentDelta(content: string): void {
     this.xmlContentBuffer += content;
     const bufLen = this.xmlContentBuffer.length;
 
-    // Log incoming content for debugging thinking tag issues
-    if (content.includes('<') || content.includes('>') || content.includes('think')) {
-      logger.debug(`[handleContentDelta] Content with tags: "${content.slice(0, 100)}" -> buffer now ${bufLen} chars, inThinking=${this.inThinkingBlock}`);
-    }
-
-    // Process buffer through thinking state machine
-    this.processThinkingState();
-
-    // If we're inside a thinking block, keep buffering (don't emit)
-    if (this.inThinkingBlock) {
-      if (bufLen > 100) {
-        logger.debug(`[handleContentDelta] Inside thinking block, buffering ${bufLen} chars`);
-      }
-      return;
-    }
-
-    // After thinking state processing, try to extract XML tool calls
+    // Try to extract XML tool calls
     const extracted = this.extractXmlToolCalls(this.xmlContentBuffer);
     if (extracted) {
       const { calls, remaining, textBefore } = extracted;
@@ -352,99 +301,6 @@ export class ResponseStreamWriter {
       this.xmlContentBuffer = "";
       this.handleTextDelta(toFlush);
     }
-  }
-
-  /**
-   * Process the xmlContentBuffer through the thinking state machine.
-   * Removes thinking content and tracks whether we're inside a thinking block.
-   * Handles cases where thinking tags don't close properly.
-   */
-  private processThinkingState(): void {
-    let buf = this.xmlContentBuffer;
-
-    // Define thinking tag patterns: [opening regex, closing regex, tag type name]
-    const thinkingPatterns: Array<[RegExp, RegExp, string]> = [
-      [/<millennia-thinking[^>]*>/gi, /<\/millennia-thinking>/gi, "millennia"],
-      [/<think>/gi, /<\/think>/gi, "think"],
-      [/<\|begin_of_thought\|>/gi, /<\|end_of_thought\|>/gi, "thought"],
-    ];
-
-    let changed = true;
-    let iterations = 0;
-    const maxIterations = 20; // Safety limit
-
-    while (changed && iterations < maxIterations) {
-      changed = false;
-      iterations++;
-
-      for (const [openRe, closeRe, tagType] of thinkingPatterns) {
-        // Reset regex lastIndex
-        openRe.lastIndex = 0;
-        closeRe.lastIndex = 0;
-
-        if (this.inThinkingBlock) {
-          // We're inside a thinking block - look for closing tag
-          const closeMatch = closeRe.exec(buf);
-          if (closeMatch) {
-            // Found closing tag - remove from opening to closing (inclusive)
-            const beforeClose = buf.slice(0, closeMatch.index);
-            const afterClose = buf.slice(closeMatch.index + closeMatch[0].length);
-            buf = beforeClose + afterClose;
-            this.inThinkingBlock = false;
-            this.thinkingTagType = null;
-            this.thinkingBuffer = "";
-            changed = true;
-            logger.debug(`[processThinkingState] Thinking block closed (${tagType}), remaining buffer: ${buf.length} chars`);
-          }
-          // If no closing tag found, keep buffering (content stays in xmlContentBuffer)
-          continue;
-        }
-
-        // Not in a thinking block - look for opening tag
-        const openMatch = openRe.exec(buf);
-        if (openMatch) {
-          // Found opening tag - check if there's a closing tag after it
-          const afterOpen = buf.slice(openMatch.index + openMatch[0].length);
-          closeRe.lastIndex = 0;
-          const closeMatch = closeRe.exec(afterOpen);
-
-          if (closeMatch) {
-            // Complete thinking block found - remove it entirely
-            const beforeOpen = buf.slice(0, openMatch.index);
-            const afterClose = afterOpen.slice(closeMatch.index + closeMatch[0].length);
-            buf = beforeOpen + afterClose;
-            changed = true;
-            logger.debug(`[processThinkingState] Removed complete thinking block (${tagType})`);
-          } else {
-            // Opening tag found but no closing tag - enter thinking block state
-            // Keep content before the opening tag as regular text
-            const beforeOpen = buf.slice(0, openMatch.index);
-            buf = buf.slice(openMatch.index); // Keep from opening tag onward
-            this.inThinkingBlock = true;
-            this.thinkingTagType = tagType;
-            this.thinkingBuffer = "";
-            changed = true;
-
-            // If there's text before the thinking block, we need to emit it
-            if (beforeOpen) {
-              // Emit the text before the thinking block immediately
-              this.xmlContentBuffer = buf;
-              this.handleTextDelta(beforeOpen);
-              // Don't continue processing - the remaining buffer is the thinking block
-              return;
-            }
-            logger.debug(`[processThinkingState] Entered thinking block (${tagType}), buffering from opening tag`);
-          }
-        }
-      }
-    }
-
-    // Also strip orphan closing tags (e.g.,  without matching opening)
-    buf = buf.replace(/<\/millennia-thinking>/gi, "");
-    buf = buf.replace(/<\/think>/gi, "");
-    buf = buf.replace(/<\|end_of_thought\|>/gi, "");
-
-    this.xmlContentBuffer = buf;
   }
 
   /** Emit a single XML-detected tool call as a complete function_call event sequence. */
@@ -830,14 +686,7 @@ export class ResponseStreamWriter {
     status: ResponseObject["status"],
     output: ResponseOutputItem[],
   ): ResponseObject {
-    const baseUsage = this.usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
-
-    // Apply inputTokenOffset so Codex sees conservative token counts
-    const usage: ResponseUsage = {
-      input_tokens: baseUsage.input_tokens + this.inputTokenOffset,
-      output_tokens: baseUsage.output_tokens,
-      total_tokens: baseUsage.total_tokens + this.inputTokenOffset,
-    };
+    const usage = this.usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
 
     return {
       id: this.responseId,

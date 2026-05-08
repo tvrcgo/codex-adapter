@@ -2,60 +2,12 @@ import { Router, type Request, type Response } from "express";
 import type { AdapterConfig } from "../config.js";
 import { resolveBackend } from "../config.js";
 import type { ResponsesRequest, ChatCompletionChunk, ChatCompletionsRequest } from "../transform/types.js";
-import { transformRequest, estimateTokens, estimateToolTokens } from "../transform/request.js";
+import { transformRequest } from "../transform/request.js";
 import { ResponseStreamWriter } from "../transform/response-stream.js";
 import { initSSE, parseSSEBuffer } from "../utils/sse.js";
 import { logger } from "../utils/logger.js";
 import { saveRequestRecord } from "../utils/request-recorder.js";
 import { nextRequestId, buildBackendHeaders, fetchBackend, readSSEChunks } from "../utils/backend.js";
-
-// --- Token estimation calibration ---
-// When backend returns real prompt_tokens, we calibrate our estimator.
-// This ensures inputTokenOffset triggers Codex compaction at the right time.
-
-interface CalibrationState {
-  ratio: number;           // EMA of real/estimated
-  lastEstimated: number;  // Last estimated token count (for computing offset)
-  samples: number;        // Number of calibration samples
-}
-
-// Initial ratio = 1.0: start neutral, let calibration adjust based on real data.
-// Previously 2.0 caused first request to report 2x tokens and trigger premature compact.
-const calibrationState: CalibrationState = {
-  ratio: 1.0,
-  lastEstimated: 0,
-  samples: 0,
-};
-
-const CALIBRATION_EMA_ALPHA = 0.6;  // Faster convergence: new sample has 60% weight
-// No floor: let calibration converge to actual ratio (which can be < 1.0)
-
-function getCalibratedEstimate(estimated: number): number {
-  return Math.floor(estimated * calibrationState.ratio);
-}
-
-function updateCalibration(realTokens: number, estimated: number): void {
-  if (realTokens <= 0 || estimated <= 0) return;
-
-  const sampleRatio = realTokens / estimated;
-  const prevRatio = calibrationState.ratio;
-
-  // EMA update: ratio = alpha * new + (1-alpha) * old
-  if (calibrationState.samples === 0) {
-    calibrationState.ratio = sampleRatio;
-  } else {
-    calibrationState.ratio =
-      CALIBRATION_EMA_ALPHA * sampleRatio + (1 - CALIBRATION_EMA_ALPHA) * prevRatio;
-  }
-
-  calibrationState.samples++;
-  calibrationState.lastEstimated = estimated;
-
-  logger.debug(
-    `Calibration: real=${realTokens} estimated=${estimated} ratio=${sampleRatio.toFixed(2)} -> ` +
-    `emaRatio=${calibrationState.ratio.toFixed(2)} samples=${calibrationState.samples}`
-  );
-}
 
 const HEARTBEAT_INTERVAL_MS = 15_000; // 15s SSE heartbeat
 
@@ -134,19 +86,10 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     return;
   }
 
-  // --- Token estimation (for logging and compression decisions) ---
-  let msgEstTokens = estimateTokens(chatReq.messages);
-  let toolsEstTokens = estimateToolTokens(chatReq.tools);
-  let adapterTotalEst = msgEstTokens + toolsEstTokens;
-
   logger.info(
     `[R${rid}] Transformed: ${chatReq.messages.length} messages, model=${chatReq.model} ` +
-    `| est_tokens: msg=${msgEstTokens} tools=${toolsEstTokens} total=${adapterTotalEst} ` +
     `| max_tokens=${backend.maxTokens ?? "unset"}`
   );
-
-  // Store calibrated estimate for offset calculation after backend response
-  const calibratedEst = getCalibratedEstimate(adapterTotalEst);
 
   logger.debug(`[R${rid}] Full request`, JSON.stringify(chatReq));
 
@@ -230,7 +173,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   if (lastAttempt.kind === "error") {
     // Always return SSE format for errors so Codex CLI can handle them properly
     initSSE(res);
-    const writer = new ResponseStreamWriter(res, chatReq.model, 0);
+    const writer = new ResponseStreamWriter(res, chatReq.model);
 
     if (lastAttempt.contextExceeded) {
       // context_length_exceeded
@@ -262,10 +205,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
 
   initSSE(res);
 
-  // Initial offset: use calibrated estimate minus a safe baseline.
-  // Will be updated once we see real prompt_tokens from the backend.
-  const initialOffset = Math.max(0, calibratedEst - adapterTotalEst);
-  const writer = new ResponseStreamWriter(res, chatReq.model, initialOffset);
+  const writer = new ResponseStreamWriter(res, chatReq.model);
   logger.debug(`[R${rid}] Writer created, bufferedChunks=${bufferedChunks.length}`);
 
   // Heartbeat timer for keepalive
@@ -276,46 +216,34 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   }, HEARTBEAT_INTERVAL_MS);
 
   let sseEventCount = 0;
-  let realPromptTokens: number | null = null;
 
-  // Helper to process a single chunk and extract prompt_tokens for calibration
-  function processAndCalibrate(chunk: ChatCompletionChunk): void {
+  function processChunkWithLogging(chunk: ChatCompletionChunk): void {
     sseEventCount++;
-    // Debug: log chunks with tool_calls
     if (chunk.choices?.some(c => c.delta?.tool_calls?.length)) {
-      logger.debug(`[R${rid}] processAndCalibrate: chunk with tool_calls, count=${sseEventCount}`);
+      logger.debug(`[R${rid}] chunk with tool_calls, count=${sseEventCount}`);
     }
-    // Debug: log chunks with content (first 50 chars)
     const contentDelta = chunk.choices?.[0]?.delta?.content;
     if (contentDelta != null && contentDelta !== "") {
-      logger.debug(`[R${rid}] processAndCalibrate: chunk with content (${contentDelta.length} chars), count=${sseEventCount}, preview="${contentDelta.slice(0, 50)}"`);
+      logger.debug(`[R${rid}] chunk with content (${contentDelta.length} chars), count=${sseEventCount}, preview="${contentDelta.slice(0, 50)}"`);
     }
-    // Log finish_reason for debugging
     const finishReason = chunk.choices?.[0]?.finish_reason;
     if (finishReason) {
-      const hasToolCalls = chunk.choices?.some(c => c.delta?.tool_calls?.length) ?? false;
-      const hasContent = chunk.choices?.some(c => c.delta?.content != null && c.delta.content !== "") ?? false;
-      logger.info(`[R${rid}] processAndCalibrate: finish_reason=${finishReason}, hasToolCalls=${hasToolCalls}, hasContent=${hasContent}, count=${sseEventCount}`);
+      logger.info(`[R${rid}] finish_reason=${finishReason}, count=${sseEventCount}`);
     }
     writer.processChunk(chunk);
-
-    // Extract real prompt_tokens when available (usually in the final chunk with usage)
-    if (chunk.usage?.prompt_tokens && realPromptTokens === null) {
-      realPromptTokens = chunk.usage.prompt_tokens;
-    }
   }
 
   try {
     // First, replay buffered chunks
     for (const chunk of bufferedChunks) {
       if (clientDisconnected) break;
-      processAndCalibrate(chunk);
+      processChunkWithLogging(chunk);
     }
 
     // Then, continue streaming from where we left off
     for await (const chunk of readSSEChunks(stream, `R${rid}`)) {
       if (clientDisconnected) break;
-      processAndCalibrate(chunk);
+      processChunkWithLogging(chunk);
     }
     logger.info(`[R${rid}] Stream loop exited, clientDisconnected=${clientDisconnected}`);
   } catch (streamErr: unknown) {
@@ -333,21 +261,6 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   }
 
   if (!clientDisconnected) {
-    // --- Update calibration and compute final offset ---
-    if (realPromptTokens !== null) {
-      updateCalibration(realPromptTokens, adapterTotalEst);
-
-      // inputTokenOffset = max(0, calibratedEst - realPromptTokens)
-      // This ensures Codex sees: input_tokens = real + offset >= calibratedEst
-      const finalOffset = Math.max(0, calibratedEst - realPromptTokens);
-      writer.setInputTokenOffset(finalOffset);
-
-      logger.info(
-        `[R${rid}] Token calibration: real_prompt=${realPromptTokens} estimated=${adapterTotalEst} ` +
-        `calibrated=${calibratedEst} offset=${finalOffset}`
-      );
-    }
-
     logger.info(`[R${rid}] About to call finalize...`);
     writer.finalize(true);
     logger.info(`[R${rid}] Finalize returned, about to res.end()`);
