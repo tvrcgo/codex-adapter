@@ -448,34 +448,6 @@ export class ResponseStreamWriter {
     this.xmlContentBuffer = buf;
   }
 
-  /**
-   * Strip thinking content from GLM-5/WPS backend.
-   * Various thinking tag formats are supported:
-   * - <millennia-thinking>...</millennia-thinking>
-   * - <think>...</think>
-   * - <|begin_of_thought|>...<|end_of_thought|>
-   */
-  private stripThinkingContent(content: string): string {
-    // Remove complete thinking blocks
-    let result = content;
-
-    // GLM-5 millennia-thinking tags
-    result = result.replace(/<millennia-thinking>[\s\S]*?<\/millennia-thinking>/gi, "");
-
-    // Generic <think> tags
-    result = result.replace(/<think>[\s\S]*?<\/think>/gi, "");
-
-    // DeepSeek-style thought markers
-    result = result.replace(/<\|begin_of_thought\|>[\s\S]*?<\|end_of_thought\|>/gi, "");
-
-    // Orphan closing tags (if opening was stripped but closing remains)
-    result = result.replace(/<\/millennia-thinking>/gi, "");
-    result = result.replace(/<\/think>/gi, "");
-    result = result.replace(/<\|end_of_thought\|>/gi, "");
-
-    return result;
-  }
-
   /** Emit a single XML-detected tool call as a complete function_call event sequence. */
   private emitXmlToolCall(call: { name: string; arguments: Record<string, unknown> }): void {
     const tcIndex = this.xmlToolCallIndex++;

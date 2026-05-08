@@ -1,19 +1,13 @@
 ﻿import { Router, type Request, type Response } from "express";
 import type { AdapterConfig } from "../config.js";
 import { resolveBackend } from "../config.js";
-import type { ChatCompletionChunk, ChatCompletionsRequest } from "../transform/types.js";
+import type { ChatCompletionsRequest } from "../transform/types.js";
 import type { AnthropicMessagesRequest } from "../transform/anthropic-types.js";
 import { transformAnthropicRequest } from "../transform/anthropic-request.js";
 import { AnthropicResponseWriter } from "../transform/anthropic-response.js";
-import { initSSE, parseSSEBuffer } from "../utils/sse.js";
+import { initSSE } from "../utils/sse.js";
 import { logger } from "../utils/logger.js";
-
-let reqCounter = 0;
-
-function encodeHeaderValue(value: string): string {
-  if (/^[\x00-\xff]*$/.test(value)) return value;
-  return encodeURIComponent(value);
-}
+import { nextRequestId, buildBackendHeaders, fetchBackend, readSSEChunks } from "../utils/backend.js";
 
 export function createAnthropicRouter(config: AdapterConfig): Router {
   const router = Router();
@@ -42,7 +36,7 @@ async function handleAnthropicMessages(
   res: Response,
   config: AdapterConfig,
 ): Promise<void> {
-  const rid = ++reqCounter;
+  const rid = nextRequestId();
   const body = req.body as AnthropicMessagesRequest;
 
   logger.debug(`[A${rid}] RAW request body: ${JSON.stringify(body).slice(0, 2000)}`);
@@ -78,90 +72,51 @@ async function handleAnthropicMessages(
 
   logger.debug(`[A${rid}] Transformed to ChatCompletions: ${JSON.stringify(chatReq).slice(0, 1000)}`);
 
-  // Build headers (same logic as responses.ts)
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "text/event-stream",
-  };
+  const headers = buildBackendHeaders(req, backend);
+  logger.info(`[A${rid}] Fetching ${backend.url}`);
 
-  if (backend.apiKey) {
-    headers["Authorization"] = `Bearer ${backend.apiKey}`;
+  const fetchResult = await fetchBackend(backend.url, headers, chatReq, `A${rid}`);
+  if (!fetchResult.ok) {
+    const status = fetchResult.status ?? 502;
+    const errorType = fetchResult.status ? "api_error" : "api_connection_error";
+    res.status(status).json({
+      type: "error",
+      error: { type: errorType, message: fetchResult.message },
+    });
+    return;
   }
 
-  // Add extra headers from config, allow client request to override
-  if (backend.extraHeaders) {
-    for (const [key, value] of Object.entries(backend.extraHeaders)) {
-      const clientVal = req.headers[key.toLowerCase()];
-      if (clientVal) {
-        headers[key] = Array.isArray(clientVal) ? clientVal[0] : clientVal;
-      } else if (value) {
-        headers[key] = encodeHeaderValue(value);
-      }
+  const upstream = fetchResult.response;
+
+  // Handle non-streaming response
+  const isStream = body.stream ?? true;
+  if (!isStream) {
+    const text = await upstream.text();
+    logger.debug(`[A${rid}] Non-stream response: ${text.slice(0, 500)}`);
+    try {
+      const chatResponse = JSON.parse(text);
+      const anthropicResponse = {
+        id: `msg_${Date.now().toString(36)}`,
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: chatResponse.choices?.[0]?.message?.content ?? "" }],
+        model: body.model,
+        stop_reason: chatResponse.choices?.[0]?.finish_reason ?? "end_turn",
+        stop_sequence: null,
+        usage: {
+          input_tokens: chatResponse.usage?.prompt_tokens ?? 0,
+          output_tokens: chatResponse.usage?.completion_tokens ?? 0,
+        },
+      };
+      res.status(200).json(anthropicResponse);
+    } catch (err) {
+      logger.error(`[A${rid}] Failed to parse non-stream response: ${err}`);
+      res.status(200).send(text);
     }
-  }
-
-  const url = backend.url;
-  logger.info(`[A${rid}] Fetching ${url}`);
-  logger.debug(`[A${rid}] Headers: ${JSON.stringify(headers)}`);
-
-  let upstream: globalThis.Response;
-  try {
-    upstream = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(chatReq),
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.error(`[A${rid}] Backend connection failed: ${msg}`);
-    res.status(502).json({
-      type: "error",
-      error: { type: "api_connection_error", message: msg },
-    });
     return;
   }
 
-  logger.info(`[A${rid}] Backend responded: ${upstream.status} ${upstream.statusText}`);
-
-  if (!upstream.ok) {
-    const errBody = await upstream.text().catch(() => "");
-    logger.error(`[A${rid}] Backend error ${upstream.status}: ${errBody.slice(0, 500)}`);
-    res.status(upstream.status).json({
-      type: "error",
-      error: { type: "api_error", message: errBody },
-    });
-    return;
-  }
-
- // Handle streaming response
- const isStream = body.stream ?? true;
- if (!isStream) {
-   const text = await upstream.text();
-   logger.debug(`[A${rid}] Non-stream response: ${text.slice(0, 500)}`);
-   try {
-     const chatResponse = JSON.parse(text);
-     const anthropicResponse = {
-       id: `msg_${Date.now().toString(36)}`,
-       type: "message",
-       role: "assistant",
-       content: [{ type: "text", text: chatResponse.choices?.[0]?.message?.content ?? "" }],
-       model: body.model,
-       stop_reason: chatResponse.choices?.[0]?.finish_reason ?? "end_turn",
-       stop_sequence: null,
-       usage: {
-         input_tokens: chatResponse.usage?.prompt_tokens ?? 0,
-         output_tokens: chatResponse.usage?.completion_tokens ?? 0,
-       },
-     };
-     res.status(200).json(anthropicResponse);
-   } catch (err) {
-     logger.error(`[A${rid}] Failed to parse non-stream response: ${err}`);
-     res.status(200).send(text);
-   }
-   return;
- }
-
-  // Streaming: set SSE headers
+  // Streaming
   initSSE(res);
 
   if (!upstream.body) {
@@ -172,51 +127,27 @@ async function handleAnthropicMessages(
 
   const thinkingEnabled = body.thinking?.type === "enabled";
   const writer = new AnthropicResponseWriter(res, body.model, thinkingEnabled);
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let chunkCount = 0;
 
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    for await (const chunk of readSSEChunks(upstream.body, `A${rid}`)) {
+      chunkCount++;
 
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-      const { events, remaining } = parseSSEBuffer(buffer);
-      buffer = remaining;
+      if (chunkCount <= 3 || chunkCount % 100 === 0) {
+        logger.debug(`[A${rid}] chunk#${chunkCount}: ${JSON.stringify(chunk).slice(0, 300)}`);
+      }
 
-      for (const evt of events) {
-        const data = evt.data.trim();
-        if (data === "[DONE]") continue;
-
-        let chunk: ChatCompletionChunk;
-        try {
-          chunk = JSON.parse(data) as ChatCompletionChunk;
-        } catch (parseErr) {
-          logger.warn(`[A${rid}] Failed to parse SSE chunk JSON (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
-          continue;
-        }
-
-        chunkCount++;
-
-        // Log first few chunks and any with content for debugging
-        if (chunkCount <= 3 || chunkCount % 100 === 0) {
-          logger.debug(`[A${rid}] chunk#${chunkCount}: ${JSON.stringify(chunk).slice(0, 300)}`);
-        }
-
-        const delta = chunk.choices?.[0]?.delta;
-        if (delta) {
-          const rc = (delta as Record<string, unknown>).reasoning_content;
-          if (rc && !delta.content) {
-            if (chunkCount <= 3) {
-              logger.info(`[A${rid}] Backend sends reasoning_content instead of content`);
-            }
+      const delta = chunk.choices?.[0]?.delta;
+      if (delta) {
+        const rc = (delta as Record<string, unknown>).reasoning_content;
+        if (rc && !delta.content) {
+          if (chunkCount <= 3) {
+            logger.info(`[A${rid}] Backend sends reasoning_content instead of content`);
           }
         }
-
-        writer.processChunk(chunk);
       }
+
+      writer.processChunk(chunk);
     }
 
     logger.info(`[A${rid}] Processed ${chunkCount} chunks`);
@@ -225,7 +156,6 @@ async function handleAnthropicMessages(
     logger.error(`[A${rid}] Stream error: ${err}`);
   }
 
-  // End the response
   res.end();
   logger.info(`[A${rid}] <<< completed`);
 }

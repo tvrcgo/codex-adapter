@@ -6,7 +6,8 @@ import { transformRequest, estimateTokens, estimateToolTokens } from "../transfo
 import { ResponseStreamWriter } from "../transform/response-stream.js";
 import { initSSE, parseSSEBuffer } from "../utils/sse.js";
 import { logger } from "../utils/logger.js";
-import { saveRequestRecord, updateRequestRecord } from "../utils/request-recorder.js";
+import { saveRequestRecord } from "../utils/request-recorder.js";
+import { nextRequestId, buildBackendHeaders, fetchBackend, readSSEChunks } from "../utils/backend.js";
 
 // --- Token estimation calibration ---
 // When backend returns real prompt_tokens, we calibrate our estimator.
@@ -56,8 +57,6 @@ function updateCalibration(realTokens: number, estimated: number): void {
   );
 }
 
-let reqCounter = 0;
-
 const HEARTBEAT_INTERVAL_MS = 15_000; // 15s SSE heartbeat
 
 // --- Router ---
@@ -92,13 +91,8 @@ export function createResponsesRouter(config: AdapterConfig): Router {
   return router;
 }
 
-function encodeHeaderValue(value: string): string {
-  if (/^[\x00-\xff]*$/.test(value)) return value;
-  return encodeURIComponent(value);
-}
-
 async function handleResponses(req: Request, res: Response, config: AdapterConfig): Promise<void> {
-  const rid = ++reqCounter;
+  const rid = nextRequestId();
   const body = req.body as ResponsesRequest;
 
   // Save full request body for inspection/replay
@@ -165,28 +159,8 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   );
   logger.debug(`[R${rid}] Full request body: ${reqBodyStr}`);
 
-  // --- Build headers for backend ---
-
   const backendUrl = backend.url;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "text/event-stream",
-  };
-
-  if (backend.apiKey) {
-    headers["Authorization"] = `Bearer ${backend.apiKey}`;
-  }
-
-  if (backend.extraHeaders) {
-    for (const [key, value] of Object.entries(backend.extraHeaders)) {
-      const clientVal = req.headers[key.toLowerCase()];
-      if (clientVal) {
-        headers[key] = Array.isArray(clientVal) ? clientVal[0] : clientVal;
-      } else if (value) {
-        headers[key] = encodeHeaderValue(value);
-      }
-    }
-  }
+  const headers = buildBackendHeaders(req, backend);
 
   // --- Retry loop: buffer and check before sending to client ---
   // If backend returns stub-reject (empty response), retry silently without client knowing.
@@ -339,40 +313,9 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     }
 
     // Then, continue streaming from where we left off
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let streamIteration = 0;
-
-    while (!clientDisconnected) {
-      const { done, value } = await reader.read();
-      streamIteration++;
-      if (done) {
-        logger.info(`[R${rid}] Stream reader done after ${streamIteration} iterations`);
-        break;
-      }
-
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-      const { events, remaining } = parseSSEBuffer(buffer);
-      buffer = remaining;
-
-      for (const evt of events) {
-        const data = evt.data.trim();
-        if (data === "[DONE]") {
-          logger.info(`[R${rid}] Received [DONE] marker from backend`);
-          continue;
-        }
-
-        let chunk: ChatCompletionChunk;
-        try {
-          chunk = JSON.parse(data) as ChatCompletionChunk;
-        } catch (parseErr) {
-          logger.warn(`[R${rid}] Failed to parse SSE chunk JSON (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
-          continue;
-        }
-
-        processAndCalibrate(chunk);
-      }
+    for await (const chunk of readSSEChunks(stream, `R${rid}`)) {
+      if (clientDisconnected) break;
+      processAndCalibrate(chunk);
     }
     logger.info(`[R${rid}] Stream loop exited, clientDisconnected=${clientDisconnected}`);
   } catch (streamErr: unknown) {
@@ -427,37 +370,21 @@ async function fetchAndBufferUntilContent(
   | { kind: "empty"; rawContent: string }
   | { kind: "error"; status?: number; message: string; contextExceeded?: boolean }
 > {
-  let upstream: globalThis.Response;
-  try {
-    upstream = await fetch(backendUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(chatReq),
-    });
-  } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error(`[R${rid}] Fetch error: ${errMsg}`);
-    return { kind: "error", message: errMsg };
-  }
-
-  logger.info(`[R${rid}] Backend responded: ${upstream.status} ${upstream.statusText}`);
-
-  if (!upstream.ok) {
-    const errBody = await upstream.text().catch(() => "");
-    logger.error(`[R${rid}] Backend error body: ${errBody}`);
+  const result = await fetchBackend(backendUrl, headers, chatReq, `R${rid}`);
+  if (!result.ok) {
     logger.error(`[R${rid}] Request that caused error: ${JSON.stringify(chatReq).slice(0, 2000)}`);
 
-    // Check for context_length_exceeded
     try {
-      const parsed = JSON.parse(errBody);
+      const parsed = JSON.parse(result.message);
       if (parsed?.error?.code === "context_length_exceeded") {
         return { kind: "error", status: 400, message: "context_length_exceeded", contextExceeded: true };
       }
     } catch {}
 
-    return { kind: "error", status: upstream.status, message: errBody };
+    return { kind: "error", status: result.status, message: result.message };
   }
 
+  const upstream = result.response;
   if (!upstream.body) {
     return { kind: "error", message: "Backend returned no body" };
   }
@@ -569,13 +496,21 @@ async function fetchAndBufferUntilContent(
   }
 
   // Create a stream that continues reading from where we left off.
-  // NOTE: We do NOT replay pendingChunks here because the caller replays
-  // bufferedChunks separately. Replaying both would cause duplicate content.
+  // IMPORTANT: Prepend any remaining (unparsed) SSE buffer data so that
+  // partial events split across TCP reads are not lost. This fixes the bug
+  // where the tool_call header chunk (containing id/name) was discarded.
   const remainingReader = reader;
+  const remainingBuffer = buffer;
+  let bufferFlushed = !remainingBuffer;
 
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
-      // Continue reading from backend (pending chunks already replayed via bufferedChunks)
+      if (!bufferFlushed) {
+        bufferFlushed = true;
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode(remainingBuffer));
+        return;
+      }
       const { done, value } = await remainingReader.read();
       if (done) {
         controller.close();
