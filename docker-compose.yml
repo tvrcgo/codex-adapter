@@ -5,4 +5,7 @@ services:
     container_name: codex-adapter
     ports:
       - "18003:3321"
+    volumes:
+      - ./logs:/app/logs
+      - ./records:/app/records
     restart: unless-stopped
