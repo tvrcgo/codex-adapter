@@ -614,7 +614,7 @@ export class ResponseStreamWriter {
       if (!active.headerEmitted) {
         this.emitToolCallHeader(active);
       }
-      const safeArgs = ResponseStreamWriter.sanitizeArguments(active.arguments);
+      const args = active.arguments || "{}";
 
       // Legacy: function_call_arguments.done
       sendEvent(this.res, "response.function_call_arguments.done", {
@@ -622,7 +622,7 @@ export class ResponseStreamWriter {
         item_id: active.itemId,
         output_index: active.outputIndex,
         call_id: active.callId,
-        arguments: safeArgs,
+        arguments: args,
       });
 
       // Modern: output_tool_call.done
@@ -632,7 +632,7 @@ export class ResponseStreamWriter {
         item_id: active.itemId,
         call_id: active.callId,
         name: active.name,
-        arguments: safeArgs,
+        arguments: args,
       });
 
       sendEvent(this.res, "response.output_item.done", {
@@ -643,28 +643,10 @@ export class ResponseStreamWriter {
           type: "function_call",
           call_id: active.callId,
           name: active.name,
-          arguments: safeArgs,
+          arguments: args,
           status: "completed",
         },
       });
-    }
-  }
-
-  /**
-   * Validate tool_call arguments JSON. If malformed, normalize to valid JSON
-   * so the client never accumulates invalid JSON in conversation history.
-   * This mirrors what wps-claude-code does with `safeParseJSON(args) ?? {}`.
-   */
-  private static sanitizeArguments(raw: string): string {
-    if (!raw || raw === "{}") return raw || "{}";
-    try {
-      JSON.parse(raw);
-      return raw;
-    } catch {
-      logger.warn(
-        `Malformed tool_call arguments detected (${raw.length} chars), normalizing to {}. Preview: ${raw.slice(0, 200)}`
-      );
-      return "{}";
     }
   }
 
@@ -721,7 +703,7 @@ export class ResponseStreamWriter {
         type: "function_call",
         call_id: active.callId,
         name: active.name,
-        arguments: ResponseStreamWriter.sanitizeArguments(active.arguments),
+        arguments: active.arguments || "{}",
         status: "completed",
       });
     }
