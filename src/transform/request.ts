@@ -14,7 +14,6 @@ import type {
   ChatToolCall,
 } from "./types.js";
 import { convertTools, convertToolChoice } from "./tools.js";
-import { getCachedReasoning, makeReasoningKey } from "../utils/reasoning-cache.js";
 import { logger } from "../utils/logger.js";
 
 const IMAGE_TAG_RE = /<\/?image>/gi;
@@ -81,12 +80,7 @@ export function transformRequest(
         }
       }
 
-      const toolCallIds = aMsg.tool_calls?.map(tc => tc.id);
-      const key = makeReasoningKey(aMsg.content, toolCallIds);
-      const reasoning = getCachedReasoning(key);
-      if (reasoning) {
-        aMsg.reasoning_content = reasoning;
-      }
+
     }
   }
 
@@ -255,10 +249,7 @@ function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
         ];
       }
 
-      // Merge reasoning_content
-      if (curAsst.reasoning_content && !prevAsst.reasoning_content) {
-        prevAsst.reasoning_content = curAsst.reasoning_content;
-      }
+
 
       continue; // skip pushing; merged into prev
     }
@@ -308,7 +299,8 @@ function convertAssistantItem(item: ResponsesMessageItem): ChatAssistantMessage 
   return { role: "assistant", content: text || null };
 }
 
-function convertUserContentParts(content: string | ResponsesContentPart[]): ChatUserContentPart[] {
+function convertUserContentParts(content: string | ResponsesContentPart[] | null | undefined): ChatUserContentPart[] {
+  if (content == null) return [{ type: "text", text: "" }];
   if (typeof content === "string") return [{ type: "text", text: content }];
 
   return content
@@ -324,7 +316,8 @@ function convertUserContentParts(content: string | ResponsesContentPart[]): Chat
     .filter((p): p is ChatUserContentPart => p !== null);
 }
 
-function extractTextContent(content: string | ResponsesContentPart[]): string {
+function extractTextContent(content: string | ResponsesContentPart[] | null | undefined): string {
+  if (content == null) return "";
   if (typeof content === "string") return content;
   return content
     .map((p) => {

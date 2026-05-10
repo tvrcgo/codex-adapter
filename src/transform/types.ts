@@ -11,7 +11,6 @@ export interface ResponsesRequest {
   top_p?: number;
   stream?: boolean;
   text?: { format?: ResponsesTextFormat };
-  reasoning?: { effort?: string };
   metadata?: Record<string, string>;
   previous_response_id?: string;
   store?: boolean;
@@ -152,7 +151,6 @@ export type ChatUserContentPart =
 export interface ChatAssistantMessage {
   role: "assistant";
   content?: string | null;
-  reasoning_content?: string | null;
   tool_calls?: ChatToolCall[];
 }
 
