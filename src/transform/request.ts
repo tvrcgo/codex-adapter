@@ -64,21 +64,6 @@ export function transformRequest(
         aMsg.content = "";
       }
 
-      // Sanitize malformed tool_call arguments (defense-in-depth).
-      // Primary protection is in response.ts; this catches edge cases
-      // where malformed args somehow entered the conversation history.
-      if (aMsg.tool_calls) {
-        for (const tc of aMsg.tool_calls) {
-          try {
-            JSON.parse(tc.function.arguments);
-          } catch {
-            logger.warn(
-              `[request] Malformed tool_call arguments in history for ${tc.function.name}, normalizing to {}`
-            );
-            tc.function.arguments = "{}";
-          }
-        }
-      }
 
 
     }
@@ -143,17 +128,10 @@ function buildMessages(body: ResponsesRequest): ChatMessage[] {
 
         while (i < items.length && isFunctionCallItem(items[i])) {
           const fc = items[i] as ResponsesFunctionCallItem;
-          let args = fc.arguments;
-          try {
-            JSON.parse(args);
-          } catch {
-            logger.warn(`[request] Malformed function_call arguments from client for ${fc.name}, normalizing to {}`);
-            args = "{}";
-          }
           toolCalls.push({
             id: fc.call_id,
             type: "function",
-            function: { name: fc.name, arguments: args },
+            function: { name: fc.name, arguments: fc.arguments },
           });
           i++;
         }
