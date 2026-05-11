@@ -9,3 +9,4 @@ export const genMessageId = () => rand("msg");
 export const genItemId = () => rand("item");
 export const genCallId = () => rand("call");
 export const genPartId = () => rand("cp");
+export const genReasoningId = () => rand("rs");

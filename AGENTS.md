@@ -4,7 +4,7 @@
 
 ## 部署
 
-使用 docker 来构建和部署项目
+使用 docker 来构建和部署项目，所有修改先部署再调试
 
 ```bash
 docker-compose up -d --build
@@ -15,6 +15,7 @@ docker-compose up -d --build
 ## 输出
 
 - 本地调试日志在 `logs/`
+- 请求录制放在 `records/`
 - 测试用例在 `tests/`
 - 临时测试脚本放在 `tmp/`
 
@@ -22,7 +23,6 @@ docker-compose up -d --build
 
 - 任务执行过程中的临时文件，任务结束后要清理
 - 项目根目录不要留临时文件
-- 所有修改先部署到docker再调试
 
 ## 红线
 

@@ -3,7 +3,7 @@ import type { AdapterConfig } from "../config.js";
 import { resolveBackend } from "../config.js";
 import type { ResponsesRequest, ChatCompletionChunk, ChatCompletionsRequest } from "../transform/types.js";
 import { transformRequest } from "../transform/request.js";
-import { ResponseStreamWriter } from "../transform/response-stream.js";
+import { ResponseStreamWriter } from "../transform/response.js";
 import { initSSE, parseSSEBuffer } from "../utils/sse.js";
 import { logger } from "../utils/logger.js";
 import { saveRequestRecord } from "../utils/request-recorder.js";
@@ -334,7 +334,6 @@ async function fetchAndBufferUntilContent(
 
         bufferedChunks.push(chunk);
 
-        // Check for actual content (including reasoning_content from master)
         if (chunk.choices?.length) {
           for (const choice of chunk.choices) {
             const d = choice.delta;

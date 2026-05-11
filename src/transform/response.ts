@@ -6,13 +6,14 @@ import type {
   ResponseOutputItem,
   ResponseMessageItem,
   ResponseFunctionCallItem,
+  ResponseReasoningItem,
   ResponseContentPart,
   ResponseUsage,
 } from "./types.js";
 import { sendEvent } from "../utils/sse.js";
-import { genResponseId, genMessageId, genItemId, genCallId } from "../utils/id.js";
+import { genResponseId, genMessageId, genItemId, genCallId, genReasoningId } from "../utils/id.js";
 import { logger } from "../utils/logger.js";
-import { cacheReasoning, makeReasoningKey } from "../utils/reasoning-cache.js";
+
 
 interface ActiveToolCall {
   index: number;
@@ -35,11 +36,15 @@ export class ResponseStreamWriter {
   private responseId: string;
   private created: boolean = false;
 
+  // Reasoning state
+  private reasoningItemId: string | null = null;
+  private reasoningOutputIndex: number = -1;
+  private reasoningSummaryText: string = "";
+
   // Text message state
   private messageItemId: string | null = null;
   private messageOutputIndex: number = -1;
   private textContent: string = "";
-  private reasoningContent: string = "";
   private textPartEmitted: boolean = false;
 
   // Tool call state
@@ -80,22 +85,16 @@ export class ResponseStreamWriter {
       if (!delta) continue;
 
       if (delta.reasoning_content != null && delta.reasoning_content !== "") {
-        this.reasoningContent += delta.reasoning_content;
+        this.handleReasoningDelta(delta.reasoning_content);
       }
 
       if (delta.content != null && delta.content !== "") {
-        // Log every content delta for root-cause analysis
-        const raw = delta.content;
-        const hasSpecial = /[<>\u0000-\u001f\u0080-\u009f]/.test(raw) || raw.includes('think');
-        if (hasSpecial || raw.length > 0) {
-          // Log repr-style: escape control chars and show exact content
-          const repr = JSON.stringify(raw);
-          logger.info(`[processChunk] raw content delta (${raw.length} chars): ${repr.length > 500 ? repr.slice(0, 500) + '...' : repr}`);
-        }
+        this.closeReasoning();
         this.handleContentDelta(delta.content);
       }
 
       if (delta.tool_calls) {
+        this.closeReasoning();
         for (const tc of delta.tool_calls) {
           this.handleToolCallDelta(tc);
         }
@@ -196,15 +195,9 @@ export class ResponseStreamWriter {
     }
 
     // Now close and send done events
+    this.closeReasoning();
     this.closeTextMessage();
     this.closeAllToolCalls();
-
-    // Cache reasoning content for reuse
-    if (this.reasoningContent) {
-      const toolCallIds = Array.from(this.activeToolCalls.values()).map(tc => tc.callId);
-      const key = makeReasoningKey(this.textContent, toolCallIds);
-      cacheReasoning(key, this.reasoningContent);
-    }
 
     // Log if text-only response (no tool calls)
     const hasToolCalls = outputItems.some(item => item.type === "function_call");
@@ -420,7 +413,71 @@ export class ResponseStreamWriter {
     return false;
   }
 
-  // ������ Text handling ������
+  // ── Reasoning handling ──
+
+  private handleReasoningDelta(content: string): void {
+    if (!this.reasoningItemId) {
+      this.openReasoning();
+    }
+
+    this.reasoningSummaryText += content;
+    sendEvent(this.res, "response.reasoning_summary_text.delta", {
+      type: "response.reasoning_summary_text.delta",
+      item_id: this.reasoningItemId,
+      output_index: this.reasoningOutputIndex,
+      summary_index: 0,
+      delta: content,
+    });
+  }
+
+  private openReasoning(): void {
+    this.reasoningItemId = genReasoningId();
+    this.reasoningOutputIndex = this.nextOutputIndex++;
+
+    const item: ResponseReasoningItem = {
+      id: this.reasoningItemId,
+      type: "reasoning",
+      summary: [],
+      encrypted_content: null,
+      status: "in_progress",
+    };
+
+    sendEvent(this.res, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: this.reasoningOutputIndex,
+      item,
+    });
+
+    sendEvent(this.res, "response.reasoning_summary_part.added", {
+      type: "response.reasoning_summary_part.added",
+      item_id: this.reasoningItemId,
+      output_index: this.reasoningOutputIndex,
+      summary_index: 0,
+      part: { type: "summary_text", text: "" },
+    });
+  }
+
+  private closeReasoning(): void {
+    if (!this.reasoningItemId) return;
+
+    const item: ResponseReasoningItem = {
+      id: this.reasoningItemId,
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: this.reasoningSummaryText }],
+      encrypted_content: null,
+      status: "completed",
+    };
+
+    sendEvent(this.res, "response.output_item.done", {
+      type: "response.output_item.done",
+      output_index: this.reasoningOutputIndex,
+      item,
+    });
+
+    this.reasoningItemId = null;
+  }
+
+  // ── Text handling ──
 
   private handleTextDelta(content: string): void {
     if (!this.messageItemId) {
@@ -683,6 +740,16 @@ export class ResponseStreamWriter {
 
   private buildOutputItems(): ResponseOutputItem[] {
     const items: ResponseOutputItem[] = [];
+
+    if (this.reasoningItemId) {
+      items.push({
+        id: this.reasoningItemId,
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: this.reasoningSummaryText }],
+        encrypted_content: null,
+        status: "completed",
+      });
+    }
 
     if (this.messageItemId) {
       const content: ResponseContentPart[] = [

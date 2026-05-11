@@ -31,9 +31,7 @@ interface ActiveToolCall {
 /**
  * Transform Chat Completions stream to Anthropic Messages stream format.
  *
- * Handles backends that use reasoning_content (thinking) + content (response):
- * - reasoning_content → Anthropic "thinking" content block
- * - content → Anthropic "text" content block
+ * When thinkingEnabled, maps backend reasoning_content to Anthropic thinking blocks.
  */
 export class AnthropicResponseWriter {
   private res: Response;
@@ -72,9 +70,8 @@ export class AnthropicResponseWriter {
       const delta = choice.delta;
       if (!delta) continue;
 
-      const rc = (delta as { reasoning_content?: string }).reasoning_content;
-      if (rc && this.thinkingEnabled) {
-        this.handleThinkingDelta(rc);
+      if (delta.reasoning_content != null && delta.reasoning_content !== "" && this.thinkingEnabled) {
+        this.handleThinkingDelta(delta.reasoning_content);
       }
 
       if (delta.content != null && delta.content !== "") {
@@ -157,7 +154,6 @@ export class AnthropicResponseWriter {
   }
 
   private handleTextDelta(text: string): void {
-    // Close thinking block when actual content starts
     if (this.thinkingBlockIndex >= 0) {
       this.emitContentBlockStop(this.thinkingBlockIndex);
       this.thinkingBlockIndex = -1;
@@ -179,7 +175,6 @@ export class AnthropicResponseWriter {
     const tcKey = tc.index;
 
     if (!this.activeToolCalls.has(tcKey)) {
-      // Close thinking/text blocks when entering tool_use territory
       if (this.thinkingBlockIndex >= 0) {
         this.emitContentBlockStop(this.thinkingBlockIndex);
         this.thinkingBlockIndex = -1;

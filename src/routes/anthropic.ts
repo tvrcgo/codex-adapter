@@ -137,16 +137,6 @@ async function handleAnthropicMessages(
         logger.debug(`[A${rid}] chunk#${chunkCount}: ${JSON.stringify(chunk).slice(0, 300)}`);
       }
 
-      const delta = chunk.choices?.[0]?.delta;
-      if (delta) {
-        const rc = (delta as Record<string, unknown>).reasoning_content;
-        if (rc && !delta.content) {
-          if (chunkCount <= 3) {
-            logger.info(`[A${rid}] Backend sends reasoning_content instead of content`);
-          }
-        }
-      }
-
       writer.processChunk(chunk);
     }
 

@@ -20,7 +20,8 @@ export interface ResponsesRequest {
 export type ResponsesInputItem =
   | ResponsesMessageItem
   | ResponsesFunctionCallItem
-  | ResponsesFunctionCallOutputItem;
+  | ResponsesFunctionCallOutputItem
+  | ResponsesReasoningItem;
 
 export interface ResponsesMessageItem {
   type?: "message";
@@ -48,6 +49,13 @@ export interface ResponsesFunctionCallOutputItem {
   type: "function_call_output";
   call_id: string;
   output: string;
+}
+
+export interface ResponsesReasoningItem {
+  type: "reasoning";
+  id: string;
+  summary?: Array<{ type: "summary_text"; text: string }>;
+  encrypted_content?: string;
 }
 
 export interface ResponsesTool {
@@ -79,7 +87,15 @@ export interface ResponseObject {
   error?: { message: string; type: string; code: string } | null;
 }
 
-export type ResponseOutputItem = ResponseMessageItem | ResponseFunctionCallItem;
+export type ResponseOutputItem = ResponseReasoningItem | ResponseMessageItem | ResponseFunctionCallItem;
+
+export interface ResponseReasoningItem {
+  id: string;
+  type: "reasoning";
+  summary: Array<{ type: "summary_text"; text: string }>;
+  encrypted_content?: string | null;
+  status?: "in_progress" | "completed";
+}
 
 export interface ResponseMessageItem {
   id: string;

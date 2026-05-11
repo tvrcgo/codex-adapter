@@ -65,7 +65,7 @@ export function transformRequest(
       }
 
       // Sanitize malformed tool_call arguments (defense-in-depth).
-      // Primary protection is in response-stream.ts; this catches edge cases
+      // Primary protection is in response.ts; this catches edge cases
       // where malformed args somehow entered the conversation history.
       if (aMsg.tool_calls) {
         for (const tc of aMsg.tool_calls) {
@@ -261,6 +261,10 @@ function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
 }
 
 function convertInputItem(item: ResponsesInputItem): ChatMessage | null {
+  if (isReasoningItem(item)) {
+    return null;
+  }
+
   if (isFunctionCallOutputItem(item)) {
     return {
       role: "tool",
@@ -340,5 +344,9 @@ function isFunctionCallItem(item: ResponsesInputItem): item is ResponsesFunction
 
 function isFunctionCallOutputItem(item: ResponsesInputItem): item is ResponsesFunctionCallOutputItem {
   return (item as ResponsesFunctionCallOutputItem).type === "function_call_output";
+}
+
+function isReasoningItem(item: ResponsesInputItem): boolean {
+  return (item as { type?: string }).type === "reasoning";
 }
 
