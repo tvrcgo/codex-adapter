@@ -24,5 +24,5 @@ app.listen(config.port, () => {
   for (const b of config.backends) {
     logger.info(`  [${b.name}] models=${b.models.join(", ")} url=${b.url}`);
   }
-  logger.info(`Routes: /v1/responses, /v1/models, /v1/messages, /v1/chat`);
+  logger.info(`Routes: /v1/responses, /v1/models, /v1/messages, /v1/chat/completions`);
 });

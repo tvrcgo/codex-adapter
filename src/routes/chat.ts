@@ -8,7 +8,7 @@ import type { ChatCompletionsRequest } from "../transform/types.js";
 export function createChatRouter(config: AdapterConfig): Router {
   const router = Router();
 
-  router.post("/v1/chat", async (req: Request, res: Response) => {
+  router.post("/v1/chat/completions", async (req: Request, res: Response) => {
     const rid = nextRequestId();
     const body = req.body as ChatCompletionsRequest;
 
@@ -24,7 +24,7 @@ export function createChatRouter(config: AdapterConfig): Router {
       return;
     }
 
-    logger.info(`[R${rid}] >>> /v1/chat model=${body.model} backend=${backend.name}`);
+    logger.info(`[R${rid}] >>> /v1/chat/completions model=${body.model} backend=${backend.name}`);
 
     const backendUrl = backend.url;
     const headers = buildBackendHeaders(req, backend);
@@ -85,7 +85,7 @@ export function createChatRouter(config: AdapterConfig): Router {
     }
 
     res.end();
-    logger.info(`[R${rid}] <<< /v1/chat Completed: ${upstream.status}`);
+    logger.info(`[R${rid}] <<< /v1/chat/completions Completed: ${upstream.status}`);
   });
 
   return router;
