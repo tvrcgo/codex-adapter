@@ -102,13 +102,8 @@ export function transformRequest(
   if (tools) {
     req.tools = tools;
 
-    // Handle tool_choice: backend config can force "required" to prevent text-only responses
-    if (backend.forceToolChoice) {
-      req.tool_choice = "required";
-    } else {
-      const toolChoice = convertToolChoice(body.tool_choice);
-      if (toolChoice) req.tool_choice = toolChoice;
-    }
+    const toolChoice = convertToolChoice(body.tool_choice);
+    if (toolChoice) req.tool_choice = toolChoice;
   }
 
   if (backend.extraBody) {
@@ -349,4 +344,3 @@ function isFunctionCallOutputItem(item: ResponsesInputItem): item is ResponsesFu
 function isReasoningItem(item: ResponsesInputItem): boolean {
   return (item as { type?: string }).type === "reasoning";
 }
-
