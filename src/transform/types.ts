@@ -162,11 +162,13 @@ export interface ChatUserMessage {
 
 export type ChatUserContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string; detail?: string } };
+  | { type: "image_url"; image_url: { url: string; detail?: string } }
+  | { type: "file"; file: { file_id: string } };
 
 export interface ChatAssistantMessage {
   role: "assistant";
   content?: string | null;
+  reasoning_content?: string;
   tool_calls?: ChatToolCall[];
 }
 

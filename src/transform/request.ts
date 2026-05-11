@@ -5,6 +5,7 @@ import type {
   ResponsesMessageItem,
   ResponsesFunctionCallItem,
   ResponsesFunctionCallOutputItem,
+  ResponsesReasoningItem,
   ResponsesContentPart,
   ChatCompletionsRequest,
   ChatMessage,
@@ -14,47 +15,15 @@ import type {
   ChatToolCall,
 } from "./types.js";
 import { convertTools, convertToolChoice } from "./tools.js";
+import type { BackendFeatures } from "../config.js";
 import { logger } from "../utils/logger.js";
-
-const IMAGE_TAG_RE = /<\/?image>/gi;
-
-/**
- * Strip image_url parts from user messages and collapse to plain text.
- * Text-only backends (GLM-5) reject image_url with "模型推理异常".
- */
-function stripImageContent(messages: ChatMessage[]): void {
-  for (const msg of messages) {
-    if (msg.role !== "user") continue;
-    const um = msg as ChatUserMessage;
-    if (typeof um.content === "string") continue;
-    if (!Array.isArray(um.content)) continue;
-
-    const hasImage = um.content.some(p => p.type === "image_url");
-    if (!hasImage) continue;
-
-    // Keep only text parts, drop image_url and <image>/<image> markers
-    const text = um.content
-      .filter((p): p is { type: "text"; text: string } => p.type === "text")
-      .map(p => p.text)
-      .join("")
-      .replace(IMAGE_TAG_RE, "")
-      .trim();
-
-    um.content = text || "[image]";
-  }
-}
 
 export function transformRequest(
   body: ResponsesRequest,
   backend: BackendConfig,
 ): ChatCompletionsRequest {
-  let messages = buildMessages(body);
+  let messages = buildMessages(body, backend.features);
   messages = validateMessageSequence(messages);
-
-  // Strip image content — text-only backends (e.g. GLM-5) reject image_url parts
-  // with "模型推理异常". Convert array content to plain text, dropping images and
-  // their <image></image> markers.
-  stripImageContent(messages);
 
   for (const msg of messages) {
     if (msg.role === "assistant") {
@@ -100,7 +69,7 @@ export function transformRequest(
   return req;
 }
 
-function buildMessages(body: ResponsesRequest): ChatMessage[] {
+function buildMessages(body: ResponsesRequest, features?: BackendFeatures): ChatMessage[] {
   const raw: ChatMessage[] = [];
 
   if (body.instructions) {
@@ -115,8 +84,19 @@ function buildMessages(body: ResponsesRequest): ChatMessage[] {
   if (Array.isArray(body.input)) {
     const items = body.input;
     let i = 0;
+    let pendingReasoning: string | null = null;
+
     while (i < items.length) {
       const item = items[i];
+
+      if (isReasoningItem(item)) {
+        const text = extractReasoningSummary(item as ResponsesReasoningItem);
+        if (text) {
+          pendingReasoning = pendingReasoning ? pendingReasoning + "\n" + text : text;
+        }
+        i++;
+        continue;
+      }
 
       if (isFunctionCallItem(item)) {
         const toolCalls: ChatToolCall[] = [];
@@ -142,13 +122,26 @@ function buildMessages(body: ResponsesRequest): ChatMessage[] {
             ...toolCalls,
           ];
         } else {
-          raw.push({ role: "assistant", content: "", tool_calls: toolCalls });
+          const asstMsg: ChatAssistantMessage = { role: "assistant", content: "", tool_calls: toolCalls };
+          if (pendingReasoning) {
+            asstMsg.reasoning_content = pendingReasoning;
+            pendingReasoning = null;
+          }
+          raw.push(asstMsg);
         }
         continue;
       }
 
-      const msg = convertInputItem(item);
-      if (msg) raw.push(msg);
+      const msg = convertInputItem(item, features);
+      if (msg) {
+        if (pendingReasoning) {
+          if (msg.role === "assistant") {
+            (msg as ChatAssistantMessage).reasoning_content = pendingReasoning;
+          }
+          pendingReasoning = null;
+        }
+        raw.push(msg);
+      }
       i++;
     }
   }
@@ -209,12 +202,20 @@ function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
       const prevAsst = prev as ChatAssistantMessage;
       const curAsst = msg as ChatAssistantMessage;
 
-      // Merge content: keep non-empty content, prefer the one with substance
-      if (curAsst.content && (!prevAsst.content || prevAsst.content === "")) {
-        prevAsst.content = curAsst.content;
+      if (curAsst.content && curAsst.content !== "") {
+        if (prevAsst.content && prevAsst.content !== "") {
+          prevAsst.content += "\n" + curAsst.content;
+        } else {
+          prevAsst.content = curAsst.content;
+        }
       }
 
-      // Merge tool_calls
+      if (curAsst.reasoning_content) {
+        prevAsst.reasoning_content = prevAsst.reasoning_content
+          ? prevAsst.reasoning_content + "\n" + curAsst.reasoning_content
+          : curAsst.reasoning_content;
+      }
+
       if ("tool_calls" in curAsst && curAsst.tool_calls?.length) {
         prevAsst.tool_calls = [
           ...(prevAsst.tool_calls ?? []),
@@ -233,11 +234,7 @@ function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
   return result;
 }
 
-function convertInputItem(item: ResponsesInputItem): ChatMessage | null {
-  if (isReasoningItem(item)) {
-    return null;
-  }
-
+function convertInputItem(item: ResponsesInputItem, features?: BackendFeatures): ChatMessage | null {
   if (isFunctionCallOutputItem(item)) {
     return {
       role: "tool",
@@ -263,10 +260,9 @@ function convertInputItem(item: ResponsesInputItem): ChatMessage | null {
     return { role: "user", content: msgItem.content };
   }
 
-  const parts = convertUserContentParts(msgItem.content);
-  // If all parts are plain text, merge them into a string (WPS/GLM doesn't support array content)
+  const parts = convertUserContentParts(msgItem.content, features);
   if (parts.every((p) => p.type === "text")) {
-    return { role: "user", content: parts.map((p) => p.text).join("") };
+    return { role: "user", content: parts.map((p) => (p as { text: string }).text).join("") };
   }
   return { role: "user", content: parts };
 }
@@ -276,21 +272,32 @@ function convertAssistantItem(item: ResponsesMessageItem): ChatAssistantMessage 
   return { role: "assistant", content: text || null };
 }
 
-function convertUserContentParts(content: string | ResponsesContentPart[] | null | undefined): ChatUserContentPart[] {
+function convertUserContentParts(
+  content: string | ResponsesContentPart[] | null | undefined,
+  features?: BackendFeatures,
+): ChatUserContentPart[] {
   if (content == null) return [{ type: "text", text: "" }];
   if (typeof content === "string") return [{ type: "text", text: content }];
 
-  return content
+  const parts = content
     .map((p): ChatUserContentPart | null => {
       if (p.type === "input_text" || p.type === "text") {
         return { type: "text", text: p.text };
       }
       if (p.type === "input_image") {
-        return { type: "image_url", image_url: { url: p.image_url } };
+        if (!features?.vision) return null;
+        return { type: "image_url", image_url: { url: (p as { image_url: string }).image_url } };
+      }
+      if (p.type === "input_file") {
+        if (!features?.files) return null;
+        return { type: "file", file: { file_id: (p as { file_id: string }).file_id } };
       }
       return null;
     })
     .filter((p): p is ChatUserContentPart => p !== null);
+
+  if (parts.length === 0) return [{ type: "text", text: "[media filtered]" }];
+  return parts;
 }
 
 function extractTextContent(content: string | ResponsesContentPart[] | null | undefined): string {
@@ -321,4 +328,11 @@ function isFunctionCallOutputItem(item: ResponsesInputItem): item is ResponsesFu
 
 function isReasoningItem(item: ResponsesInputItem): boolean {
   return (item as { type?: string }).type === "reasoning";
+}
+
+function extractReasoningSummary(item: ResponsesReasoningItem): string {
+  if (!item.summary?.length) return "";
+  return item.summary
+    .map(s => s.text)
+    .join("\n");
 }

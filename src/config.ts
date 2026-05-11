@@ -2,6 +2,11 @@
 import { resolve } from "node:path";
 import yaml from "js-yaml";
 
+export interface BackendFeatures {
+  vision?: boolean;
+  files?: boolean;
+}
+
 export interface BackendConfig {
   name: string;
   models: string[];
@@ -9,8 +14,9 @@ export interface BackendConfig {
   apiKey: string;
   maxTokens?: number;
   extraHeaders?: Record<string, string>;
-  extraBody?: Record<string, unknown> | null;  // null to disable default extraBody
+  extraBody?: Record<string, unknown> | null;
   stripParams?: string[];
+  features?: BackendFeatures;
 }
 
 export interface AdapterConfig {
@@ -35,6 +41,7 @@ interface RawBackend {
   extra_headers?: Record<string, string>;
   extra_body?: Record<string, unknown> | null;
   strip_params?: string[];
+  features?: BackendFeatures;
 }
 
 interface RawConfig {
@@ -71,6 +78,7 @@ function parseBackend(b: RawBackend, index: number): BackendConfig {
     extraHeaders: b.extra_headers,
     extraBody,
     stripParams: b.strip_params,
+    features: b.features,
   };
 }
 

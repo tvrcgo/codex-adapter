@@ -40,6 +40,7 @@ export class ResponseStreamWriter {
   private reasoningItemId: string | null = null;
   private reasoningOutputIndex: number = -1;
   private reasoningSummaryText: string = "";
+  private completedReasoningItem: ResponseReasoningItem | null = null;
 
   // Text message state
   private messageItemId: string | null = null;
@@ -474,6 +475,7 @@ export class ResponseStreamWriter {
       item,
     });
 
+    this.completedReasoningItem = item;
     this.reasoningItemId = null;
   }
 
@@ -741,7 +743,9 @@ export class ResponseStreamWriter {
   private buildOutputItems(): ResponseOutputItem[] {
     const items: ResponseOutputItem[] = [];
 
-    if (this.reasoningItemId) {
+    if (this.completedReasoningItem) {
+      items.push(this.completedReasoningItem);
+    } else if (this.reasoningItemId) {
       items.push({
         id: this.reasoningItemId,
         type: "reasoning",
