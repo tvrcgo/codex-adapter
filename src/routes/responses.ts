@@ -173,7 +173,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   if (lastAttempt.kind === "error") {
     // Always return SSE format for errors so Codex CLI can handle them properly
     initSSE(res);
-    const writer = new ResponseStreamWriter(res, chatReq.model);
+    const writer = new ResponseStreamWriter(res, body.model);
 
     if (lastAttempt.contextExceeded) {
       // context_length_exceeded
@@ -192,7 +192,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     // After all retries, still empty - synthesize a response so Codex doesn't hang
     logger.error(`[R${rid}] All ${MAX_ATTEMPTS} attempts returned empty response`);
     initSSE(res);
-    const writer = new ResponseStreamWriter(res, chatReq.model);
+    const writer = new ResponseStreamWriter(res, body.model);
     writer.finalize(false);
     res.end();
     return;
@@ -205,7 +205,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
 
   initSSE(res);
 
-  const writer = new ResponseStreamWriter(res, chatReq.model);
+  const writer = new ResponseStreamWriter(res, body.model);
   logger.debug(`[R${rid}] Writer created, bufferedChunks=${bufferedChunks.length}`);
 
   // Heartbeat timer for keepalive

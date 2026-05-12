@@ -55,7 +55,7 @@ async function handleAnthropicMessages(
   }
 
   logger.info(
-    `[A${rid}] >>> model=${body.model} backend=${backend.name} messages=${body.messages.length} stream=${body.stream ?? true}`,
+    `[A${rid}] >>> model=${body.model} backend=${backend.name} messages=${body.messages.length} tools=${body.tools?.length ?? 0} stream=${body.stream ?? true}`,
   );
 
   let chatReq: ChatCompletionsRequest;
@@ -70,6 +70,9 @@ async function handleAnthropicMessages(
     return;
   }
 
+  logger.info(
+    `[A${rid}] Backend request: body=${(JSON.stringify(chatReq).length / 1024).toFixed(1)}KB messages=${chatReq.messages.length} tools=${chatReq.tools?.length ?? 0} model=${chatReq.model}`,
+  );
   logger.debug(`[A${rid}] Transformed to ChatCompletions: ${JSON.stringify(chatReq).slice(0, 1000)}`);
 
   const headers = buildBackendHeaders(req, backend);

@@ -88,7 +88,6 @@ export function resolveBackend(config: AdapterConfig, modelName?: string): Backe
   }
   return (
     config.backends.find((b) => b.models.includes(modelName)) ??
-    config.backends.find((b) => b.name === modelName) ??
     config.backends.find((b) => b.name === config.defaultBackend) ??
     config.backends[0]
   );

@@ -67,6 +67,10 @@ export class AnthropicResponseWriter {
     if (!chunk.choices?.length) return;
 
     for (const choice of chunk.choices) {
+      if (choice.finish_reason) {
+        logger.debug(`[anthropic-writer] finish_reason=${choice.finish_reason}`);
+      }
+
       const delta = choice.delta;
       if (!delta) continue;
 
@@ -98,7 +102,6 @@ export class AnthropicResponseWriter {
     }
 
     for (const [, tc] of this.activeToolCalls) {
-      // Flush any tool calls whose header was never emitted (name never arrived)
       if (!tc.headerEmitted) {
         this.emitContentBlockStart(tc.index, {
           type: "tool_use",
@@ -120,6 +123,12 @@ export class AnthropicResponseWriter {
     if (this.contentBlockIndex >= 0) {
       this.emitContentBlockStop(this.contentBlockIndex);
     }
+
+    const stopReason = this.activeToolCalls.size > 0 ? "tool_use" : "end_turn";
+    const toolNames = [...this.activeToolCalls.values()].map(tc => tc.name);
+    logger.info(
+      `[anthropic-finalize] stop_reason=${stopReason} tool_calls=${this.activeToolCalls.size}${toolNames.length ? ` tools=[${toolNames.join(",")}]` : ""} thinking=${this.thinkingEnabled} blocks=${this.nextBlockIndex}`,
+    );
 
     this.emitMessageDelta();
     this.emitMessageStop();

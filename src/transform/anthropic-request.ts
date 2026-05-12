@@ -23,8 +23,10 @@ export function transformAnthropicRequest(
 ): ChatCompletionsRequest {
   const messages = buildMessages(body);
 
+  const mappedModel = backend.models.includes(body.model) ? body.model : backend.models[0];
+
   const req: ChatCompletionsRequest = {
-    model: body.model,
+    model: mappedModel,
     messages,
     max_tokens: body.max_tokens,
     stream: body.stream ?? true,
