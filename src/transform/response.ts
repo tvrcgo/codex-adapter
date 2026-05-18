@@ -52,10 +52,6 @@ export class ResponseStreamWriter {
   private activeToolCalls: Map<number, ActiveToolCall> = new Map();
   private nextOutputIndex: number = 0;
 
-  // XML tool call detection state
-  private xmlContentBuffer: string = "";
-  private xmlToolCallIndex: number = 1000;
-
   private usage: ResponseUsage | null = null;
 
   constructor(res: Response, model: string) {
@@ -105,15 +101,6 @@ export class ResponseStreamWriter {
 
   /** Call after the upstream stream ends ([DONE]) to emit closing events. */
   finalize(hasContent: boolean = true): void {
-    // Flush any remaining XML buffer as text
-    if (this.xmlContentBuffer) {
-      const toFlush = this.xmlContentBuffer;
-      this.xmlContentBuffer = "";
-      logger.debug(`[finalize] Flushing remaining xmlContentBuffer (${toFlush.length} chars): ${toFlush.slice(0, 300)}`);
-      this.handleTextDelta(toFlush);
-    }
-
-
     // If backend sent tool_calls without any text content, synthesize a message item
     // so Codex CLI receives proper SSE events (output_item.added, content_part.added, etc.)
     // Use the next available output_index so it doesn't collide with already-emitted tool calls.
@@ -254,167 +241,10 @@ export class ResponseStreamWriter {
     });
   }
 
-  // ������ Content delta with XML tool call detection ������
-
-  /**
-   * Handle content delta: detect XML-style tool calls from backends that
-   * output tool calls as text (e.g., Hermes/Llama via vLLM, or models
-   * prompted with OpenAI XML format) and convert them to function_call events.
-   */
   private handleContentDelta(content: string): void {
-    this.xmlContentBuffer += content;
-    const bufLen = this.xmlContentBuffer.length;
-
-    // Try to extract XML tool calls
-    const extracted = this.extractXmlToolCalls(this.xmlContentBuffer);
-    if (extracted) {
-      const { calls, remaining, textBefore } = extracted;
-      this.xmlContentBuffer = remaining;
-
-      if (textBefore) {
-        this.handleTextDelta(textBefore);
-      }
-
-      for (const call of calls) {
-        this.emitXmlToolCall(call);
-      }
-      return;
-    }
-
-    // Check if we're potentially in the middle of an XML tool call pattern
-    if (this.isPartialXmlToolCall(this.xmlContentBuffer)) {
-      if (bufLen > 100) {
-        logger.debug(`[handleContentDelta] Buffering ${bufLen} chars for partial pattern: ${this.xmlContentBuffer.slice(-100)}`);
-      }
-      return;
-    }
-
-    // Not an XML tool call - flush buffer as regular text
-    if (this.xmlContentBuffer) {
-      const toFlush = this.xmlContentBuffer;
-      this.xmlContentBuffer = "";
-      this.handleTextDelta(toFlush);
-    }
+    this.handleTextDelta(content);
   }
 
-  /** Emit a single XML-detected tool call as a complete function_call event sequence. */
-  private emitXmlToolCall(call: { name: string; arguments: Record<string, unknown> }): void {
-    const tcIndex = this.xmlToolCallIndex++;
-    const callId = genCallId();
-    const itemId = genItemId();
-    const outputIndex = this.nextOutputIndex++;
-    const argsStr = JSON.stringify(call.arguments);
-
-    const active: ActiveToolCall = {
-      index: tcIndex,
-      itemId,
-      callId,
-      name: call.name,
-      arguments: argsStr,
-      outputIndex,
-      headerEmitted: true,
-    };
-
-    // header (output_item.added + output_tool_call.begin)
-    this.emitToolCallHeader(active);
-
-    // delta (both legacy + modern)
-    this.emitToolCallArgumentsDelta(active, argsStr);
-
-    // Track for finalize/closeAllToolCalls
-    this.activeToolCalls.set(tcIndex, active);
-
-    logger.info(`[XML->function_call] name=${call.name} args=${argsStr.slice(0, 100)}`);
-  }
-
-  /**
-   * Extract complete XML tool calls from content.
-   *
-   * Supported formats:
-   * - Hermes: <tool_call>{"name":"func","arguments":{...}}</tool_call>
-   *   Also accepts "parameters" as alias for "arguments".
-   * - OpenAI XML: <function=name><parameter=key>value</parameter></function>
-   */
-  private extractXmlToolCalls(content: string): {
-    calls: Array<{ name: string; arguments: Record<string, unknown> }>;
-    remaining: string;
-    textBefore: string;
-  } | null {
-    const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
-    let firstMatchStart = -1;
-    let lastMatchEnd = 0;
-
-    // Pattern 1: Hermes — <tool_call>JSON</tool_call>
-    const hermesRegex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-    let match: RegExpExecArray | null;
-
-    while ((match = hermesRegex.exec(content)) !== null) {
-      if (firstMatchStart === -1) firstMatchStart = match.index;
-      lastMatchEnd = match.index + match[0].length;
-
-      try {
-        const parsed = JSON.parse(match[1].trim());
-        const name = parsed.name ?? parsed.function ?? "";
-        const args = parsed.arguments ?? parsed.parameters ?? {};
-        if (name) {
-          calls.push({ name, arguments: typeof args === "object" ? args : {} });
-        }
-      } catch {
-        logger.warn(`[extractXmlToolCalls] Failed to parse Hermes JSON: ${match[1].slice(0, 200)}`);
-      }
-    }
-
-    // Pattern 2: OpenAI XML — <function=name>...<parameter=key>value</parameter>...</function>
-    if (calls.length === 0) {
-      const funcRegex = /<function=([^>]+)>([\s\S]*?)<\/function>/g;
-      const paramRegex = /<parameter=([^>]+)>([\s\S]*?)<\/parameter>/g;
-
-      while ((match = funcRegex.exec(content)) !== null) {
-        if (firstMatchStart === -1) firstMatchStart = match.index;
-        lastMatchEnd = match.index + match[0].length;
-
-        const name = match[1].trim();
-        const body = match[2];
-        const args: Record<string, unknown> = {};
-
-        let paramMatch: RegExpExecArray | null;
-        paramRegex.lastIndex = 0;
-        while ((paramMatch = paramRegex.exec(body)) !== null) {
-          args[paramMatch[1].trim()] = paramMatch[2];
-        }
-
-        calls.push({ name, arguments: args });
-      }
-    }
-
-    if (calls.length === 0) return null;
-
-    const textBefore = firstMatchStart > 0 ? content.slice(0, firstMatchStart) : "";
-    const remaining = lastMatchEnd < content.length ? content.slice(lastMatchEnd) : "";
-
-    return { calls, remaining, textBefore };
-  }
-
-  /** Check if content might be the start of an incomplete XML tool call pattern. */
-  private isPartialXmlToolCall(content: string): boolean {
-    const trimmed = content.trimEnd();
-    if (!trimmed) return false;
-
-    // Incomplete opening tag
-    if (/<[a-z_]*$/i.test(trimmed)) return true;
-    if (/<tool_call[^>]*$/i.test(trimmed)) return true;
-    if (/<function=[^>]*$/i.test(trimmed)) return true;
-
-    // Opened but not yet closed
-    if (/<tool_call[^>]*>/.test(trimmed) && !trimmed.includes("</tool_call>")) return true;
-    if (/<function=[^>]+>/.test(trimmed) && !trimmed.includes("</function>")) return true;
-
-    if (trimmed.length > 2000) return false;
-
-    return false;
-  }
-
-  // ── Reasoning handling ──
 
   private handleReasoningDelta(content: string): void {
     if (!this.reasoningItemId) {

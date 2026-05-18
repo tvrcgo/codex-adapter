@@ -4,7 +4,7 @@
 
 ## 部署
 
-使用 docker 来构建和部署项目，所有修改先部署再调试
+使用 docker-compose 来构建和部署项目，所有修改先部署再调试
 
 ```bash
 docker-compose up -d --build
