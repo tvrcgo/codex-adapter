@@ -5,7 +5,7 @@ import type { ResponsesRequest, ChatCompletionChunk, ChatCompletionsRequest } fr
 import { transformRequest } from "../transform/request.js";
 import { ResponseStreamWriter } from "../transform/response.js";
 import { initSSE, parseSSEBuffer } from "../utils/sse.js";
-import { logger } from "../utils/logger.js";
+import { logger, isDebug } from "../utils/logger.js";
 import { saveRequestRecord } from "../utils/request-recorder.js";
 import { nextRequestId, buildBackendHeaders, fetchBackend, readSSEChunks } from "../utils/backend.js";
 
@@ -47,12 +47,6 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   const rid = nextRequestId();
   const body = req.body as ResponsesRequest;
 
-  // Save full request body for inspection/replay
-  saveRequestRecord(body, null, `${body.model}_R${rid}`).catch(err =>
-    logger.warn(`[R${rid}] Failed to save request record: ${err}`)
-  );
-
-  // Log request body for debugging
   logger.debug(`[R${rid}] RAW request body: ${JSON.stringify(body).slice(0, 5000)}`);
 
   const backend = resolveBackend(config, body.model);
@@ -76,8 +70,9 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   let chatReq: ChatCompletionsRequest;
   try {
     chatReq = transformRequest(body, backend);
-    // Save transformed request for debugging
-    saveRequestRecord(body, chatReq, `${body.model}_R${rid}_transformed`).catch(() => {});
+    if (isDebug()) {
+      saveRequestRecord(body, chatReq, `${body.model}_R${rid}_transformed`).catch(() => {});
+    }
   } catch (err) {
     logger.error(`[R${rid}] Transform failed`, err);
     res.status(400).json({
@@ -86,21 +81,14 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
     return;
   }
 
+  const reqBodySize = JSON.stringify(chatReq).length;
   logger.info(
     `[R${rid}] Transformed: ${chatReq.messages.length} messages, model=${chatReq.model} ` +
-    `| max_tokens=${backend.maxTokens ?? "unset"}`
+    `| body=${(reqBodySize / 1024).toFixed(1)}KB ` +
+    `tools=${chatReq.tools?.length ?? 0} max_tokens=${chatReq.max_tokens ?? backend.maxTokens ?? "unset"}`
   );
 
-  logger.debug(`[R${rid}] Full request`, JSON.stringify(chatReq));
-
-  // Log actual request body for diagnosis
-  const reqBodyStr = JSON.stringify(chatReq);
-  logger.info(
-    `[R${rid}] Backend request: body=${(reqBodyStr.length / 1024).toFixed(1)}KB ` +
-    `messages=${chatReq.messages.length} tools=${chatReq.tools?.length ?? 0} ` +
-    `max_tokens=${chatReq.max_tokens ?? "unset"} model=${chatReq.model}`
-  );
-  logger.debug(`[R${rid}] Full request body: ${reqBodyStr}`);
+  logger.debug(`[R${rid}] Full request body`, JSON.stringify(chatReq));
 
   const backendUrl = backend.url;
   const headers = buildBackendHeaders(req, backend);

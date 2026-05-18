@@ -1,4 +1,4 @@
-﻿import { appendFileSync, mkdirSync, existsSync } from "node:fs";
+﻿import { appendFile, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const;
@@ -34,8 +34,32 @@ function ensureLogFile(): string {
   return logFile;
 }
 
+// --- Async buffered writer ---
+let writeBuffer: string[] = [];
+let flushScheduled = false;
+const FLUSH_INTERVAL_MS = 500;
+
+function scheduleFlush(): void {
+  if (flushScheduled) return;
+  flushScheduled = true;
+  setTimeout(flushBuffer, FLUSH_INTERVAL_MS);
+}
+
+function flushBuffer(): void {
+  flushScheduled = false;
+  if (writeBuffer.length === 0) return;
+  const batch = writeBuffer.join("");
+  writeBuffer = [];
+  const file = ensureLogFile();
+  appendFile(file, batch, () => {});
+}
+
 export function setLogLevel(level: keyof typeof LEVELS): void {
   threshold = LEVELS[level];
+}
+
+export function isDebug(): boolean {
+  return threshold <= LEVELS.debug;
 }
 
 function log(level: keyof typeof LEVELS, msg: string, data?: unknown): void {
@@ -47,8 +71,12 @@ function log(level: keyof typeof LEVELS, msg: string, data?: unknown): void {
     : "";
   const line = prefix + " " + msg + suffix;
   console.log(line);
-  try { appendFileSync(ensureLogFile(), line + "\n"); } catch {}
+  writeBuffer.push(line + "\n");
+  scheduleFlush();
 }
+
+// Flush remaining logs on exit
+process.on("exit", flushBuffer);
 
 export const logger = {
   debug: (msg: string, data?: unknown) => log("debug", msg, data),
