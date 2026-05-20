@@ -1,6 +1,6 @@
 import type { Request } from "express";
 import type { BackendConfig } from "../config.js";
-import type { ChatCompletionChunk } from "../transform/types.js";
+import type { ChatCompletionChunk, ChatCompletionsRequest } from "../transform/types.js";
 import { parseSSEBuffer } from "./sse.js";
 import { logger } from "./logger.js";
 
@@ -80,6 +80,159 @@ export async function fetchBackend(
   }
 
   return { ok: true, response: upstream };
+}
+
+// --- Shared retry types and helpers ---
+
+export type BufferAttemptResult =
+  | { kind: "success"; bufferedChunks: ChatCompletionChunk[]; stream: ReadableStream<Uint8Array> }
+  | { kind: "empty"; rawContent: string }
+  | { kind: "error"; status?: number; message: string; contextExceeded?: boolean };
+
+/**
+ * Fetch backend and buffer SSE chunks until real content (text / tool_calls / reasoning)
+ * is detected. Returns immediately on first content chunk so callers can stream-through.
+ * If no content arrives before [DONE], classifies the result as empty (stub-reject) or error.
+ */
+export async function fetchAndBufferUntilContent(
+  backendUrl: string,
+  headers: Record<string, string>,
+  chatReq: ChatCompletionsRequest,
+  label: string,
+): Promise<BufferAttemptResult> {
+  const result = await fetchBackend(backendUrl, headers, chatReq, label);
+  if (!result.ok) {
+    logger.error(`[${label}] Request that caused error: ${JSON.stringify(chatReq).slice(0, 2000)}`);
+
+    try {
+      const parsed = JSON.parse(result.message);
+      if (parsed?.error?.code === "context_length_exceeded") {
+        return { kind: "error", status: 400, message: "context_length_exceeded", contextExceeded: true };
+      }
+    } catch {}
+
+    return { kind: "error", status: result.status, message: result.message };
+  }
+
+  const upstream = result.response;
+  if (!upstream.body) {
+    return { kind: "error", message: "Backend returned no body" };
+  }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  const bufferedChunks: ChatCompletionChunk[] = [];
+  const pendingChunks: Uint8Array[] = [];
+  let buffer = "";
+  let hasContent = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      pendingChunks.push(value);
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      const { events, remaining } = parseSSEBuffer(buffer);
+      buffer = remaining;
+
+      for (const evt of events) {
+        const data = evt.data.trim();
+        if (data === "[DONE]") continue;
+
+        let chunk: ChatCompletionChunk;
+        try {
+          chunk = JSON.parse(data) as ChatCompletionChunk;
+        } catch (parseErr) {
+          logger.warn(`[${label}] Failed to parse SSE chunk JSON (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
+          continue;
+        }
+
+        bufferedChunks.push(chunk);
+
+        if (chunk.choices?.length) {
+          for (const choice of chunk.choices) {
+            const d = choice.delta;
+            if (d && ((d.content != null && d.content !== "") || (d.reasoning_content != null && d.reasoning_content !== "") || d.tool_calls?.length)) {
+              hasContent = true;
+              if (d.tool_calls?.length) {
+                logger.debug(`[${label}] Backend tool_calls: ${JSON.stringify(d.tool_calls).slice(0, 200)}`);
+              }
+            }
+          }
+        }
+      }
+
+      if (hasContent) {
+        logger.info(`[${label}] Got real content after ${bufferedChunks.length} chunks, switching to stream-through`);
+        break;
+      }
+    }
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error(`[${label}] Error buffering: ${errMsg}`);
+    return { kind: "error", message: errMsg };
+  }
+
+  if (!hasContent) {
+    const rawContent = pendingChunks.map(c => decoder.decode(c, { stream: true })).join("");
+
+    try {
+      const parsed = JSON.parse(rawContent.trim());
+      if (parsed.code || parsed.error || parsed.msg) {
+        const errMsg = parsed.msg || parsed.error?.message || parsed.message || rawContent;
+        logger.error(`[${label}] Backend returned error in stream: ${rawContent.slice(0, 500)}`);
+        const contextExceeded = parsed.error?.code === "context_length_exceeded";
+        return { kind: "error", status: 400, message: errMsg, contextExceeded };
+      }
+    } catch {}
+
+    for (const chunk of bufferedChunks) {
+      const chunkObj = chunk as unknown as Record<string, unknown>;
+      if (!chunk.choices?.length) {
+        if (chunkObj.error) {
+          const errMsg = JSON.stringify(chunkObj.error);
+          logger.error(`[${label}] Backend error in SSE chunk: ${errMsg}`);
+          return { kind: "error", status: 400, message: errMsg };
+        }
+        if (chunkObj.code && chunkObj.message) {
+          const errMsg = `[${chunkObj.code}] ${chunkObj.message}${chunkObj.type ? ` (${chunkObj.type})` : ''}`;
+          logger.error(`[${label}] Backend error in SSE chunk: ${errMsg}`);
+          return { kind: "error", status: typeof chunkObj.code === 'number' ? chunkObj.code : 500, message: errMsg };
+        }
+      }
+    }
+
+    logger.warn(`[${label}] Stub-reject detected: ${rawContent.length} bytes, no real content`);
+    logger.debug(`[${label}] Stub-reject raw content: ${rawContent}`);
+    return { kind: "empty", rawContent };
+  }
+
+  const remainingReader = reader;
+  const remainingBuffer = buffer;
+  let bufferFlushed = !remainingBuffer;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!bufferFlushed) {
+        bufferFlushed = true;
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode(remainingBuffer));
+        return;
+      }
+      const { done, value } = await remainingReader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel() {
+      remainingReader.cancel();
+    }
+  });
+
+  return { kind: "success", bufferedChunks, stream };
 }
 
 /** Read SSE stream and yield parsed ChatCompletionChunk objects. */

@@ -4,10 +4,10 @@ import { resolveBackend } from "../config.js";
 import type { ResponsesRequest, ChatCompletionChunk, ChatCompletionsRequest } from "../transform/types.js";
 import { transformRequest } from "../transform/request.js";
 import { ResponseStreamWriter } from "../transform/response.js";
-import { initSSE, parseSSEBuffer } from "../utils/sse.js";
+import { initSSE } from "../utils/sse.js";
 import { logger, isDebug } from "../utils/logger.js";
 import { saveRequestRecord } from "../utils/request-recorder.js";
-import { nextRequestId, buildBackendHeaders, fetchBackend, readSSEChunks } from "../utils/backend.js";
+import { nextRequestId, buildBackendHeaders, readSSEChunks, fetchAndBufferUntilContent, type BufferAttemptResult } from "../utils/backend.js";
 
 const HEARTBEAT_INTERVAL_MS = 15_000; // 15s SSE heartbeat
 
@@ -106,11 +106,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   });
 
   const MAX_ATTEMPTS = 10;
-  type AttemptResult =
-    | { kind: "success"; bufferedChunks: ChatCompletionChunk[]; stream: ReadableStream<Uint8Array> }
-    | { kind: "empty"; rawContent: string }
-    | { kind: "error"; status?: number; message: string; contextExceeded?: boolean };
-  let lastAttempt: AttemptResult | null = null;
+  let lastAttempt: BufferAttemptResult | null = null;
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (attempt > 0) {
@@ -121,7 +117,7 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
 
     if (clientDisconnected) break;
 
-    const attemptResult = await fetchAndBufferUntilContent(backendUrl, headers, chatReq, rid);
+    const attemptResult = await fetchAndBufferUntilContent(backendUrl, headers, chatReq, `R${rid}`);
 
     if (attemptResult.kind === "success") {
       lastAttempt = attemptResult;
@@ -257,171 +253,4 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   } else {
     logger.warn(`[R${rid}] Client disconnected, skipping finalize`);
   }
-}
-
-// --- Helper: fetch and buffer until we see real content ---
-
-async function fetchAndBufferUntilContent(
-  backendUrl: string,
-  headers: Record<string, string>,
-  chatReq: ChatCompletionsRequest,
-  rid: number,
-): Promise<
-  | { kind: "success"; bufferedChunks: ChatCompletionChunk[]; stream: ReadableStream<Uint8Array> }
-  | { kind: "empty"; rawContent: string }
-  | { kind: "error"; status?: number; message: string; contextExceeded?: boolean }
-> {
-  const result = await fetchBackend(backendUrl, headers, chatReq, `R${rid}`);
-  if (!result.ok) {
-    logger.error(`[R${rid}] Request that caused error: ${JSON.stringify(chatReq).slice(0, 2000)}`);
-
-    try {
-      const parsed = JSON.parse(result.message);
-      if (parsed?.error?.code === "context_length_exceeded") {
-        return { kind: "error", status: 400, message: "context_length_exceeded", contextExceeded: true };
-      }
-    } catch {}
-
-    return { kind: "error", status: result.status, message: result.message };
-  }
-
-  const upstream = result.response;
-  if (!upstream.body) {
-    return { kind: "error", message: "Backend returned no body" };
-  }
-
-  // Read chunks until we see actual content (not stub-reject)
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  const bufferedChunks: ChatCompletionChunk[] = [];
-  const pendingChunks: Uint8Array[] = []; // Raw bytes for replay
-  let buffer = "";
-  let hasContent = false;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      pendingChunks.push(value);
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-      const { events, remaining } = parseSSEBuffer(buffer);
-      buffer = remaining;
-
-      for (const evt of events) {
-        const data = evt.data.trim();
-        if (data === "[DONE]") continue;
-
-        let chunk: ChatCompletionChunk;
-        try {
-          chunk = JSON.parse(data) as ChatCompletionChunk;
-        } catch (parseErr) {
-          logger.warn(`[R${rid}] Failed to parse SSE chunk JSON in tryOnce (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
-          continue;
-        }
-
-        bufferedChunks.push(chunk);
-
-        if (chunk.choices?.length) {
-          for (const choice of chunk.choices) {
-            const d = choice.delta;
-            if (d && ((d.content != null && d.content !== "") || (d.reasoning_content != null && d.reasoning_content !== "") || d.tool_calls?.length)) {
-              hasContent = true;
-              // Log tool calls from backend
-              if (d.tool_calls?.length) {
-                logger.debug(`[R${rid}] Backend tool_calls: ${JSON.stringify(d.tool_calls).slice(0, 200)}`);
-              }
-              // Log content delta for debugging XML tool detection
-              if (d.content && (d.content.includes('<command') || d.content.includes('<execute'))) {
-                logger.debug(`[R${rid}] Backend content with XML tool: ${d.content.slice(0, 300)}`);
-              }
-            }
-          }
-        }
-      }
-
-      // If we got real content, we can return success and continue streaming
-      if (hasContent) {
-        logger.info(`[R${rid}] Got real content after ${bufferedChunks.length} chunks, switching to stream-through`);
-        break;
-      }
-    }
-  } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error(`[R${rid}] Error buffering: ${errMsg}`);
-    return { kind: "error", message: errMsg };
-  }
-
-  if (!hasContent) {
-    // No real content found - check if backend returned an error in the stream
-    const rawContent = pendingChunks.map(c => decoder.decode(c, { stream: true })).join("");
-
-    // Try to detect error responses from backend (non-SSE JSON or SSE with error)
-    try {
-      // Case 1: raw non-SSE JSON error (e.g. {"code":10001,"msg":"param_wrong"})
-      const parsed = JSON.parse(rawContent.trim());
-      if (parsed.code || parsed.error || parsed.msg) {
-        const errMsg = parsed.msg || parsed.error?.message || parsed.message || rawContent;
-        logger.error(`[R${rid}] Backend returned error in stream: ${rawContent.slice(0, 500)}`);
-        const contextExceeded = parsed.error?.code === "context_length_exceeded";
-        return { kind: "error", status: 400, message: errMsg, contextExceeded };
-      }
-    } catch {
-      // Not a single JSON object - try parsing SSE events for errors
-    }
-
-    // Case 2: Check buffered chunks for error indicators (no choices, error-like structure)
-    for (const chunk of bufferedChunks) {
-      const chunkObj = chunk as unknown as Record<string, unknown>;
-      if (!chunk.choices?.length) {
-        // Check for error in various formats
-        if (chunkObj.error) {
-          const errMsg = JSON.stringify(chunkObj.error);
-          logger.error(`[R${rid}] Backend error in SSE chunk: ${errMsg}`);
-          return { kind: "error", status: 400, message: errMsg };
-        }
-        // WPS/GLM error format: {"code":"504","message":"...","type":"模型推理异常"}
-        if (chunkObj.code && chunkObj.message) {
-          const errMsg = `[${chunkObj.code}] ${chunkObj.message}${chunkObj.type ? ` (${chunkObj.type})` : ''}`;
-          logger.error(`[R${rid}] Backend error in SSE chunk: ${errMsg}`);
-          return { kind: "error", status: typeof chunkObj.code === 'number' ? chunkObj.code : 500, message: errMsg };
-        }
-      }
-    }
-
-    // Otherwise treat as stub-reject
-    logger.warn(`[R${rid}] Stub-reject detected: ${rawContent.length} bytes, no real content`);
-    logger.debug(`[R${rid}] Stub-reject raw content: ${rawContent}`);
-    return { kind: "empty", rawContent };
-  }
-
-  // Create a stream that continues reading from where we left off.
-  // IMPORTANT: Prepend any remaining (unparsed) SSE buffer data so that
-  // partial events split across TCP reads are not lost. This fixes the bug
-  // where the tool_call header chunk (containing id/name) was discarded.
-  const remainingReader = reader;
-  const remainingBuffer = buffer;
-  let bufferFlushed = !remainingBuffer;
-
-  const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (!bufferFlushed) {
-        bufferFlushed = true;
-        const encoder = new TextEncoder();
-        controller.enqueue(encoder.encode(remainingBuffer));
-        return;
-      }
-      const { done, value } = await remainingReader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      controller.enqueue(value);
-    },
-    cancel() {
-      remainingReader.cancel();
-    }
-  });
-
-  return { kind: "success", bufferedChunks, stream };
 }
