@@ -101,86 +101,8 @@ export class ResponseStreamWriter {
 
   /** Call after the upstream stream ends ([DONE]) to emit closing events. */
   finalize(hasContent: boolean = true): void {
-    // If backend sent tool_calls without any text content, synthesize a message item
-    // so Codex CLI receives proper SSE events (output_item.added, content_part.added, etc.)
-    // Use the next available output_index so it doesn't collide with already-emitted tool calls.
-    //
-    // IMPORTANT: We emit the full lifecycle here (added → done) and do NOT set
-    // messageItemId/textPartEmitted, so closeTextMessage() won't re-emit done events.
-    // Codex CLI appends every output_item.done as a separate history entry without
-    // dedup, so duplicate done events cause consecutive empty assistant messages in
-    // the next request — which GLM-5 rejects as "模型推理异常".
-    let synthOutputItem: ResponseOutputItem | null = null;
-
-    if (!this.messageItemId && this.activeToolCalls.size > 0) {
-      const synthId = genMessageId();
-      const synthOutputIndex = this.nextOutputIndex++;
-      const nowItem: ResponseMessageItem = {
-        id: synthId,
-        type: "message",
-        role: "assistant",
-        status: "in_progress",
-        content: [],
-      };
-
-      sendEvent(this.res, "response.output_item.added", {
-        type: "response.output_item.added",
-        output_index: synthOutputIndex,
-        item: nowItem,
-      });
-
-      sendEvent(this.res, "response.content_part.added", {
-        type: "response.content_part.added",
-        item_id: synthId,
-        output_index: synthOutputIndex,
-        content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
-      });
-
-      sendEvent(this.res, "response.output_text.done", {
-        type: "response.output_text.done",
-        item_id: synthId,
-        output_index: synthOutputIndex,
-        content_index: 0,
-        text: "",
-      });
-
-      sendEvent(this.res, "response.content_part.done", {
-        type: "response.content_part.done",
-        item_id: synthId,
-        output_index: synthOutputIndex,
-        content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
-      });
-
-      sendEvent(this.res, "response.output_item.done", {
-        type: "response.output_item.done",
-        output_index: synthOutputIndex,
-        item: {
-          id: synthId,
-          type: "message",
-          role: "assistant",
-          status: "completed",
-          content: [{ type: "output_text", text: "", annotations: [] }],
-        },
-      });
-
-      synthOutputItem = {
-        id: synthId,
-        type: "message",
-        role: "assistant",
-        status: "completed",
-        content: [{ type: "output_text", text: "", annotations: [] }],
-      };
-
-      logger.info(`[finalize] Synthesized message item at output_index=${synthOutputIndex} for tool-only response`);
-    }
-
     // Build output items BEFORE closing (which resets state)
     const outputItems = this.buildOutputItems();
-    if (synthOutputItem) {
-      outputItems.unshift(synthOutputItem);
-    }
 
     // Now close and send done events
     this.closeReasoning();

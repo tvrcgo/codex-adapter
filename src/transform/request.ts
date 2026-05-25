@@ -170,6 +170,7 @@ function mergeSystemMessages(messages: ChatMessage[]): ChatMessage[] {
  * - Merge consecutive assistant messages (backends like GLM-5 reject them)
  * - Remove orphaned tool messages (no matching preceding tool_call_id)
  * - Deduplicate duplicate tool_call_id in tool messages
+ * - Remove empty assistant messages (no content, no tool_calls, no reasoning)
  */
 function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
   // First pass: collect all tool_call_ids from assistant messages
@@ -231,7 +232,22 @@ function validateMessageSequence(messages: ChatMessage[]): ChatMessage[] {
     result.push(msg);
   }
 
-  return result;
+  // Third pass: remove empty assistant messages (no content, no tool_calls).
+  // These are artifacts from previously synthesized SSE events that pollute
+  // conversation history. Backends like GLM-5 may reject or misbehave with them.
+  const filtered: ChatMessage[] = [];
+  for (const msg of result) {
+    if (msg.role === "assistant") {
+      const asst = msg as ChatAssistantMessage;
+      const hasContent = asst.content != null && asst.content !== "";
+      const hasTools = asst.tool_calls != null && asst.tool_calls.length > 0;
+      const hasReasoning = asst.reasoning_content != null && asst.reasoning_content !== "";
+      if (!hasContent && !hasTools && !hasReasoning) continue;
+    }
+    filtered.push(msg);
+  }
+
+  return filtered;
 }
 
 function convertInputItem(item: ResponsesInputItem, features?: BackendFeatures): ChatMessage | null {
