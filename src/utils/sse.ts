@@ -24,6 +24,9 @@ export interface ParsedSSEEvent {
  * This function also handles residual \r for robustness.
  *
  * Per the SSE spec, multiple `data:` lines within one event are joined with \n.
+ * Some backends (e.g. GLM-5) emit literal newlines inside JSON string values
+ * in the data field, creating lines without a `data:` prefix. These "spill-over"
+ * lines are appended to the preceding data line to avoid data loss.
  */
 export function parseSSEBuffer(buffer: string): { events: ParsedSSEEvent[]; remaining: string } {
   const events: ParsedSSEEvent[] = [];
@@ -41,6 +44,12 @@ export function parseSSEBuffer(buffer: string): { events: ParsedSSEEvent[]; rema
         dataLines.push(line.slice(6));
       } else if (line.startsWith("data:")) {
         dataLines.push(line.slice(5));
+      } else if (line.startsWith(":") || line.startsWith("event:") || line.startsWith("id:") || line.startsWith("retry:")) {
+        // Standard SSE fields / comments — skip
+      } else if (dataLines.length > 0) {
+        // Spill-over: literal newline inside a data field value (e.g. heredoc in JSON).
+        // Append to the last data line so the JSON payload stays intact.
+        dataLines[dataLines.length - 1] += "\n" + line;
       }
     }
     if (dataLines.length > 0) {

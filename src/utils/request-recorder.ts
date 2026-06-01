@@ -176,6 +176,31 @@ export async function updateRequestRecord(
   }
 }
 
+/**
+ * Save the raw SSE response stream content paired with a request record.
+ * File is saved as `{id}.sse` in the same date directory as the request.
+ */
+export async function saveResponseRecord(
+  id: string,
+  rawContent: string,
+): Promise<void> {
+  if (!id) return;
+  await ensureRecordsDir();
+
+  const dateStr = extractDateFromId(id);
+  const dateDir = path.join(RECORDS_DIR, dateStr);
+  await ensureDateDir(dateDir);
+
+  const filePath = path.join(dateDir, `${id}.sse`);
+
+  try {
+    await fs.writeFile(filePath, rawContent, "utf-8");
+    logger.info(`[Recorder] Saved response record: ${id}.sse (${(rawContent.length / 1024).toFixed(1)}KB)`);
+  } catch (err) {
+    logger.error(`[Recorder] Failed to save response record: ${err}`);
+  }
+}
+
 export async function deleteRequestRecord(id: string): Promise<boolean> {
   await ensureRecordsDir();
 

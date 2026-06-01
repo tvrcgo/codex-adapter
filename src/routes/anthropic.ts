@@ -6,8 +6,9 @@ import type { AnthropicMessagesRequest } from "../transform/anthropic-types.js";
 import { transformAnthropicRequest } from "../transform/anthropic-request.js";
 import { AnthropicResponseWriter } from "../transform/anthropic-response.js";
 import { initSSE } from "../utils/sse.js";
-import { logger } from "../utils/logger.js";
-import { nextRequestId, buildBackendHeaders, fetchBackend, readSSEChunks, fetchAndBufferUntilContent, type BufferAttemptResult } from "../utils/backend.js";
+import { logger, isDebug } from "../utils/logger.js";
+import { saveResponseRecord } from "../utils/request-recorder.js";
+import { nextRequestId, buildBackendHeaders, fetchBackend, readSSEChunks, fetchAndBufferUntilContent, createRecordingStream, type BufferAttemptResult } from "../utils/backend.js";
 
 export function createAnthropicRouter(config: AdapterConfig): Router {
   const router = Router();
@@ -196,7 +197,17 @@ async function handleAnthropicMessages(
 
   // --- Success: replay buffered chunks and stream remaining ---
 
-  const { bufferedChunks, stream } = lastAttempt;
+  const { bufferedChunks, stream: rawStream, rawBufferedContent } = lastAttempt;
+
+  const debugRecord = isDebug();
+  let recordingGetContent: (() => string) | null = null;
+  let stream = rawStream;
+
+  if (debugRecord) {
+    const rec = createRecordingStream(rawStream);
+    stream = rec.stream;
+    recordingGetContent = rec.getRecordedContent;
+  }
 
   initSSE(res);
   const thinkingEnabled = body.thinking?.type === "enabled";
@@ -220,6 +231,13 @@ async function handleAnthropicMessages(
   } catch (streamErr: unknown) {
     const errMsg = streamErr instanceof Error ? streamErr.message : String(streamErr);
     logger.error(`[A${rid}] Error during stream replay: ${errMsg}`);
+  }
+
+  if (debugRecord && recordingGetContent) {
+    const fullRaw = rawBufferedContent + recordingGetContent();
+    const recordId = `res_A${rid}_${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23)}`;
+    saveResponseRecord(recordId, fullRaw).catch(() => {});
+    logger.info(`[A${rid}] Raw response saved: ${recordId} (${(fullRaw.length / 1024).toFixed(1)}KB)`);
   }
 
   if (!clientDisconnected) {

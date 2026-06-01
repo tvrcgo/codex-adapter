@@ -85,7 +85,7 @@ export async function fetchBackend(
 // --- Shared retry types and helpers ---
 
 export type BufferAttemptResult =
-  | { kind: "success"; bufferedChunks: ChatCompletionChunk[]; stream: ReadableStream<Uint8Array> }
+  | { kind: "success"; bufferedChunks: ChatCompletionChunk[]; stream: ReadableStream<Uint8Array>; rawBufferedContent: string }
   | { kind: "empty"; rawContent: string }
   | { kind: "error"; status?: number; message: string; contextExceeded?: boolean };
 
@@ -140,13 +140,8 @@ export async function fetchAndBufferUntilContent(
         const data = evt.data.trim();
         if (data === "[DONE]") continue;
 
-        let chunk: ChatCompletionChunk;
-        try {
-          chunk = JSON.parse(data) as ChatCompletionChunk;
-        } catch (parseErr) {
-          logger.warn(`[${label}] Failed to parse SSE chunk JSON (${data.length} chars): ${parseErr instanceof Error ? parseErr.message : parseErr}. Preview: ${data.slice(0, 200)}`);
-          continue;
-        }
+        const chunk = parseChunkJSON(data, label);
+        if (!chunk) continue;
 
         bufferedChunks.push(chunk);
 
@@ -203,8 +198,21 @@ export async function fetchAndBufferUntilContent(
       }
     }
 
+    // Detect "zero-metadata" response: proxy rejected the request without forwarding to model.
+    // Signature: created=0, id="", model="", usage={} — retrying is pointless.
+    const isProxyReject = bufferedChunks.some(c =>
+      c.created === 0 && c.id === "" && c.model === ""
+    );
+    if (isProxyReject) {
+      logger.error(`[${label}] Proxy-level reject: backend returned zero-metadata empty response (request likely too large or blocked)`);
+      return { kind: "error", status: 400, message: "Backend proxy rejected the request (zero-metadata response). The conversation context may be too large — try starting a new session.", contextExceeded: true };
+    }
+
     logger.warn(`[${label}] Stub-reject detected: ${rawContent.length} bytes, no real content`);
-    logger.debug(`[${label}] Stub-reject raw content: ${rawContent}`);
+    logger.warn(`[${label}] Stub-reject raw: ${rawContent.slice(0, 500)}`);
+    if (bufferedChunks.length) {
+      logger.warn(`[${label}] Stub-reject parsed chunks: ${JSON.stringify(bufferedChunks).slice(0, 500)}`);
+    }
     return { kind: "empty", rawContent };
   }
 
@@ -232,7 +240,66 @@ export async function fetchAndBufferUntilContent(
     }
   });
 
-  return { kind: "success", bufferedChunks, stream };
+  const rawBufferedContent = pendingChunks.map(c => new TextDecoder().decode(c)).join("");
+  return { kind: "success", bufferedChunks, stream, rawBufferedContent };
+}
+
+/**
+ * Parse a SSE data payload as JSON, with fallback for literal newlines
+ * that some backends (GLM-5) inject inside JSON string values.
+ */
+function parseChunkJSON(data: string, label: string): ChatCompletionChunk | null {
+  try {
+    return JSON.parse(data) as ChatCompletionChunk;
+  } catch {
+    // Fallback: replace literal newlines with JSON escape \\n and retry
+    if (data.includes("\n")) {
+      try {
+        const fixed = data.replace(/\n/g, "\\n");
+        const chunk = JSON.parse(fixed) as ChatCompletionChunk;
+        logger.debug(`[${label}] Recovered SSE chunk by escaping literal newlines (${data.length} chars)`);
+        return chunk;
+      } catch {}
+    }
+    logger.warn(
+      `[${label}] SSE chunk parse error (${data.length} chars). ` +
+      `Preview: ${data.slice(0, 200)}`
+    );
+    return null;
+  }
+}
+
+/**
+ * Wrap a ReadableStream to record all bytes passing through.
+ * The returned `stream` behaves identically to the original;
+ * call `getRecordedContent()` after the stream is fully consumed.
+ */
+export function createRecordingStream(
+  original: ReadableStream<Uint8Array>,
+): { stream: ReadableStream<Uint8Array>; getRecordedContent: () => string } {
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  const reader = original.getReader();
+
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+      controller.enqueue(value);
+    },
+    cancel() {
+      reader.cancel();
+    },
+  });
+
+  return {
+    stream,
+    getRecordedContent: () => chunks.join(""),
+  };
 }
 
 /** Read SSE stream and yield parsed ChatCompletionChunk objects. */
@@ -260,15 +327,8 @@ export async function* readSSEChunks(
           continue;
         }
 
-        try {
-          yield JSON.parse(data) as ChatCompletionChunk;
-        } catch (parseErr) {
-          logger.warn(
-            `[${label}] SSE chunk parse error (${data.length} chars): ` +
-            `${parseErr instanceof Error ? parseErr.message : parseErr}. ` +
-            `Preview: ${data.slice(0, 200)}`
-          );
-        }
+        const chunk = parseChunkJSON(data, label);
+        if (chunk) yield chunk;
       }
     }
   } finally {

@@ -6,8 +6,8 @@ import { transformRequest } from "../transform/request.js";
 import { ResponseStreamWriter } from "../transform/response.js";
 import { initSSE } from "../utils/sse.js";
 import { logger, isDebug } from "../utils/logger.js";
-import { saveRequestRecord } from "../utils/request-recorder.js";
-import { nextRequestId, buildBackendHeaders, readSSEChunks, fetchAndBufferUntilContent, type BufferAttemptResult } from "../utils/backend.js";
+import { saveRequestRecord, saveResponseRecord } from "../utils/request-recorder.js";
+import { nextRequestId, buildBackendHeaders, readSSEChunks, fetchAndBufferUntilContent, createRecordingStream, type BufferAttemptResult } from "../utils/backend.js";
 
 const HEARTBEAT_INTERVAL_MS = 15_000; // 15s SSE heartbeat
 
@@ -185,7 +185,17 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
   
   // --- Success: replay buffered chunks and stream remaining ---
 
-  const { bufferedChunks, stream } = lastAttempt;
+  const { bufferedChunks, stream: rawStream, rawBufferedContent } = lastAttempt;
+
+  const debugRecord = isDebug();
+  let recordingGetContent: (() => string) | null = null;
+  let stream = rawStream;
+
+  if (debugRecord) {
+    const rec = createRecordingStream(rawStream);
+    stream = rec.stream;
+    recordingGetContent = rec.getRecordedContent;
+  }
 
   initSSE(res);
 
@@ -242,6 +252,13 @@ async function handleResponses(req: Request, res: Response, config: AdapterConfi
       heartbeatTimer = null;
     }
     logger.info(`[R${rid}] Finally block reached, clientDisconnected=${clientDisconnected}`);
+  }
+
+  if (debugRecord && recordingGetContent) {
+    const fullRaw = rawBufferedContent + recordingGetContent();
+    const recordId = `res_R${rid}_${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23)}`;
+    saveResponseRecord(recordId, fullRaw).catch(() => {});
+    logger.info(`[R${rid}] Raw response saved: ${recordId} (${(fullRaw.length / 1024).toFixed(1)}KB)`);
   }
 
   if (!clientDisconnected) {
