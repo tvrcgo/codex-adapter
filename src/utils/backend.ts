@@ -204,8 +204,8 @@ export async function fetchAndBufferUntilContent(
       c.created === 0 && c.id === "" && c.model === ""
     );
     if (isProxyReject) {
-      logger.error(`[${label}] Proxy-level reject: backend returned zero-metadata empty response (request likely too large or blocked)`);
-      return { kind: "error", status: 400, message: "Backend proxy rejected the request (zero-metadata response). The conversation context may be too large — try starting a new session.", contextExceeded: true };
+      logger.error(`[${label}] Proxy-level reject: backend returned zero-metadata empty response`);
+      return { kind: "error", status: 502, message: "Backend proxy rejected the request — the model may be temporarily unavailable or the request was blocked. Please retry." };
     }
 
     logger.warn(`[${label}] Stub-reject detected: ${rawContent.length} bytes, no real content`);
