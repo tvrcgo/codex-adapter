@@ -1,18 +1,28 @@
 import express from "express";
-import type { AdapterConfig } from "./config.js";
+import { loadConfig } from "./config.js";
+import { setLogLevel, logger } from "./utils/logger.js";
 import { createResponsesRouter } from "./routes/responses.js";
 import { createModelsRouter } from "./routes/models.js";
 import { createAnthropicRouter } from "./routes/anthropic.js";
 import { createChatRouter } from "./routes/chat.js";
 
-export function createApp(config: AdapterConfig): express.Application {
-  const app = express();
-  app.use(express.json({ limit: "10mb" }));
+const configPath = process.argv[2] || undefined;
+const config = loadConfig(configPath);
+setLogLevel(config.logLevel ?? "info");
 
-  app.use(createResponsesRouter(config));
-  app.use(createModelsRouter(config));
-  app.use(createAnthropicRouter(config));
-  app.use(createChatRouter(config));
+const app = express();
+app.use(express.json({ limit: "10mb" }));
 
-  return app;
-}
+app.use(createResponsesRouter(config));
+app.use(createModelsRouter(config));
+app.use(createAnthropicRouter(config));
+app.use(createChatRouter(config));
+
+app.listen(config.port, () => {
+  logger.info(`codex-adapter listening on http://localhost:${config.port}`);
+  logger.info(`${config.backends.length} backend(s) configured, default: ${config.defaultBackend}`);
+  for (const b of config.backends) {
+    logger.info(`  [${b.name}] models=${b.models.join(", ")} url=${b.url}`);
+  }
+  logger.info(`Routes: /v1/responses, /v1/models, /v1/messages, /v1/chat/completions`);
+});

@@ -16,4 +16,4 @@ COPY --from=builder /app/dist/ dist/
 COPY config.yml ./
 
 EXPOSE 3321
-CMD ["node", "dist/bootstrap.js", "/app/config.yml"]
+CMD ["node", "dist/index.js", "/app/config.yml"]

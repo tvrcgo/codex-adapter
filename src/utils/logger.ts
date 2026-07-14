@@ -5,7 +5,9 @@ const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const;
 
 let threshold: number = LEVELS.info;
 
-const LOG_BASE_DIR = join(process.cwd(), "logs");
+const LOG_BASE_DIR = process.env.CODEX_DATA_DIR
+  ? join(process.env.CODEX_DATA_DIR, "logs")
+  : join(process.cwd(), "logs");
 try { mkdirSync(LOG_BASE_DIR, { recursive: true }); } catch {}
 
 let currentMonth = "";

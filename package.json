@@ -6,8 +6,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/bootstrap.js",
-    "dev": "tsx watch src/bootstrap.ts"
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
   },
   "engines": {
     "node": ">=18"

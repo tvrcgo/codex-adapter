@@ -1,9 +1,10 @@
-import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage } from "electron";
+import { app, BrowserWindow, Tray, Menu, nativeImage } from "electron";
 import { exec } from "node:child_process";
 import path from "path";
 import { fileURLToPath } from "url";
-import { createPanelRouter } from "./panel-router.mjs";
-import { ensureConfig, getConfigDir } from "./config-store.mjs";
+import { ensureConfig, getConfigDir, readConfigContent } from "./config-store.mjs";
+import { spawnServer } from "./sidecar.mjs";
+import { registerIpcHandlers } from "./ipc.mjs";
 
 app.setName("codex-adapter");
 
@@ -11,8 +12,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let tray = null;
 let mainWindow = null;
-let server = null;
-let config = null;
+let child = null;
+let serverPort = 0;
 let serverStarted = false;
 
 function openDir(dir) {
@@ -24,65 +25,10 @@ function openDir(dir) {
   exec(cmd);
 }
 
-function getIcon() {
-  const sizes = [16, 32, 64];
-  for (const size of sizes) {
-    const iconPath = path.join(__dirname, "..", "assets", `icon-${size}.png`);
-    try {
-      const icon = nativeImage.createFromPath(iconPath);
-      if (!icon.isEmpty()) return icon.resize({ width: 16, height: 16 });
-    } catch {}
-  }
-  return nativeImage.createEmpty();
-}
-
-async function startServer() {
-  if (serverStarted) return;
-  try {
-    const configPath = ensureConfig();
-    const { loadConfig } = await import("../../dist/config.js");
-    config = loadConfig(configPath);
-    const { setLogLevel, logger } = await import("../../dist/utils/logger.js");
-    setLogLevel(config.logLevel ?? "info");
-
-    const { createApp } = await import("../../dist/index.js");
-    const expressApp = createApp(config);
-    expressApp.use(createPanelRouter(config));
-
-    server = expressApp.listen(config.port, () => {
-      serverStarted = true;
-      logger.info(`codex-adapter listening on http://localhost:${config.port}`);
-      sendStatus();
-      updateTrayMenu();
-    });
-  } catch (err) {
-    console.error("Failed to start server:", err.message);
-  }
-}
-
-function stopServer() {
-  return new Promise((resolve) => {
-    if (!serverStarted || !server) { resolve(); return; }
-    server.close(() => {
-      serverStarted = false;
-      server = null;
-      console.log("Server stopped");
-      sendStatus();
-      updateTrayMenu();
-      resolve();
-    });
-  });
-}
-
-async function restartServer() {
-  await stopServer();
-  await startServer();
-}
-
 function sendStatus() {
   mainWindow?.webContents.send("server-status", {
     running: serverStarted,
-    port: config?.port ?? 0,
+    port: serverPort,
   });
 }
 
@@ -93,7 +39,7 @@ function updateTrayMenu() {
       label: serverStarted ? "停止服务" : "启动服务",
       click: async () => {
         if (serverStarted) await stopServer();
-        else await startServer();
+        else startServer();
       },
     },
     {
@@ -110,16 +56,82 @@ function updateTrayMenu() {
     {
       label: "退出",
       click: () => {
-        stopServer();
-        app.quit();
+        stopServer().then(() => app.quit());
       },
     },
   ]);
   tray.setContextMenu(contextMenu);
 }
 
+function startServer() {
+  return new Promise((resolve) => {
+    if (serverStarted) { resolve(); return; }
+    const configPath = ensureConfig();
+    const m = readConfigContent().match(/^port:\s*(\d+)/m);
+    serverPort = m ? parseInt(m[1]) : 3321;
+
+    child = spawnServer(configPath, {
+      onStart: () => {
+        serverStarted = true;
+        sendStatus();
+        updateTrayMenu();
+        resolve();
+      },
+      onStop: () => {
+        serverStarted = false;
+        child = null;
+        sendStatus();
+        updateTrayMenu();
+      },
+      onError: () => {
+        serverStarted = false;
+        child = null;
+        resolve();
+      },
+    });
+  });
+}
+
+function stopServer() {
+  return new Promise((resolve) => {
+    if (!child) { resolve(); return; }
+    child.on("exit", () => {
+      serverStarted = false;
+      child = null;
+      sendStatus();
+      updateTrayMenu();
+      resolve();
+    });
+    child.kill();
+  });
+}
+
+async function restartServer() {
+  await stopServer();
+  startServer();
+}
+
+registerIpcHandlers({
+  get serverStarted() { return serverStarted; },
+  get serverPort() { return serverPort; },
+  startServer,
+  stopServer,
+  restartServer,
+  openConfigDir: () => openDir(getConfigDir()),
+});
+
 function createTray() {
-  const icon = getIcon();
+  const icon = (() => {
+    for (const size of [16, 32, 64]) {
+      const p = path.join(__dirname, "..", "assets", `icon-${size}.png`);
+      try {
+        const i = nativeImage.createFromPath(p);
+        if (!i.isEmpty()) return i.resize({ width: 16, height: 16 });
+      } catch {}
+    }
+    return nativeImage.createEmpty();
+  })();
+
   tray = new Tray(icon);
   tray.setToolTip("Codex Adapter");
   tray.on("click", () => {
@@ -158,38 +170,10 @@ function createWindow() {
   });
 }
 
-function registerIpcHandlers() {
-  ipcMain.handle("get-status", () => ({
-    running: serverStarted,
-    port: config?.port ?? 0,
-  }));
-
-  ipcMain.handle("start-server", async () => {
-    await startServer();
-    return { running: serverStarted, port: config?.port ?? 0 };
-  });
-
-  ipcMain.handle("stop-server", async () => {
-    await stopServer();
-    return { running: serverStarted, port: config?.port ?? 0 };
-  });
-
-  ipcMain.handle("restart-server", async () => {
-    await restartServer();
-    return { running: serverStarted, port: config?.port ?? 0 };
-  });
-
-  ipcMain.handle("open-config-dir", () => {
-    openDir(getConfigDir());
-  });
-}
-
 app.whenReady().then(() => {
-  registerIpcHandlers();
-  startServer().then(() => {
-    createTray();
-    createWindow();
-  });
+  createTray();
+  createWindow();
+  startServer();
 });
 
 app.on("window-all-closed", () => {});

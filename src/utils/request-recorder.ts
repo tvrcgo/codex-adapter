@@ -2,7 +2,9 @@
 import * as path from "path";
 import { logger } from "./logger.js";
 
-const RECORDS_DIR = "records";
+const RECORDS_DIR = process.env.CODEX_DATA_DIR
+  ? path.join(process.env.CODEX_DATA_DIR, "records")
+  : "records";
 
 let recordsDirReady = false;
 
