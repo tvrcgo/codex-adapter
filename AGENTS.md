@@ -4,9 +4,10 @@
 
 ## 架构
 
-核心机制：Express 服务提供 `createApp()` 工厂函数，支持两种运行模式：
-- **桌面模式 (Electron)**：主进程调用 `createApp()` 嵌入 Express，提供系统托盘 + 管理面板
-- **独立模式 (CLI/Docker)**：`node dist/index.js` 直接启动 Express 服务
+两层解耦：
+- **server**（`src/`）：纯 Express 服务，`node dist/index.js config.yml` 直接启动
+- **desktop**（`desktop/`）：Electron 壳，通过 `sidecar.mjs` 以子进程方式 `spawn` server，不 import server 源码
+- Docker / CLI 只依赖 server 层，desktop 不进构建产物
 
 ## 部署
 
