@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Codex Adapter</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1e1e2e;
+    color: #cdd6f4;
+    padding: 24px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  h1 { font-size: 18px; margin-bottom: 20px; color: #cba6f7; }
+  .status-card {
+    background: #313244;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .status-dot {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .status-dot.running { background: #a6e3a1; box-shadow: 0 0 6px #a6e3a1; }
+  .status-dot.stopped { background: #f38ba8; }
+  .status-label { font-size: 14px; }
+  .status-port { font-size: 12px; color: #a6adc8; }
+  .actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: opacity 0.2s;
+  }
+  button:hover { opacity: 0.85; }
+  button:active { opacity: 0.7; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .btn-start { background: #a6e3a1; color: #1e1e2e; }
+  .btn-stop { background: #f38ba8; color: #1e1e2e; }
+  .btn-restart { background: #89b4fa; color: #1e1e2e; }
+  .btn-config { background: #45475a; color: #cdd6f4; }
+  .info {
+    background: #313244;
+    border-radius: 8px;
+    padding: 16px;
+    flex: 1;
+    overflow-y: auto;
+  }
+  .info h2 { font-size: 13px; color: #a6adc8; margin-bottom: 8px; }
+  .info-line { font-size: 12px; line-height: 1.8; color: #bac2de; }
+</style>
+</head>
+<body>
+<h1>Codex Adapter</h1>
+
+<div class="status-card">
+  <div class="status-dot stopped" id="statusDot"></div>
+  <div>
+    <div class="status-label" id="statusLabel">服务未运行</div>
+    <div class="status-port" id="statusPort"></div>
+  </div>
+</div>
+
+<div class="actions">
+  <button class="btn-start" id="btnStart">启动</button>
+  <button class="btn-stop" id="btnStop" disabled>停止</button>
+  <button class="btn-restart" id="btnRestart" disabled>重启</button>
+  <button class="btn-config" id="btnConfig">配置目录</button>
+</div>
+
+<div class="info">
+  <h2>信息</h2>
+  <div class="info-line" id="infoText">加载中...</div>
+</div>
+
+<script>
+const statusDot = document.getElementById("statusDot");
+const statusLabel = document.getElementById("statusLabel");
+const statusPort = document.getElementById("statusPort");
+const infoText = document.getElementById("infoText");
+const btnStart = document.getElementById("btnStart");
+const btnStop = document.getElementById("btnStop");
+const btnRestart = document.getElementById("btnRestart");
+const btnConfig = document.getElementById("btnConfig");
+
+function updateUI(running, port) {
+  statusDot.className = "status-dot " + (running ? "running" : "stopped");
+  statusLabel.textContent = running ? "服务运行中" : "服务未运行";
+  statusPort.textContent = running ? "端口: " + port : "";
+  btnStart.disabled = running;
+  btnStop.disabled = !running;
+  btnRestart.disabled = !running;
+}
+
+btnStart.addEventListener("click", async () => {
+  const status = await window.electronAPI.startServer();
+  updateUI(status.running, status.port);
+});
+btnStop.addEventListener("click", async () => {
+  const status = await window.electronAPI.stopServer();
+  updateUI(status.running, status.port);
+});
+btnRestart.addEventListener("click", async () => {
+  const status = await window.electronAPI.restartServer();
+  updateUI(status.running, status.port);
+});
+btnConfig.addEventListener("click", () => {
+  window.electronAPI.openConfigDir();
+});
+
+window.electronAPI.onServerStatus((status) => {
+  updateUI(status.running, status.port);
+});
+
+(async () => {
+  const status = await window.electronAPI.getStatus();
+  updateUI(status.running, status.port);
+  infoText.textContent = "管理面板就绪\n\n点击托盘图标可重新打开此面板\n关闭窗口将隐藏到托盘，服务继续运行";
+})();
+</script>
+</body>
+</html>

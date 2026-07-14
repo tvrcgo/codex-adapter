@@ -1,0 +1,18 @@
+import { loadConfig } from "./config.js";
+import { setLogLevel, logger } from "./utils/logger.js";
+import { createApp } from "./index.js";
+
+const configPath = process.argv[2] || undefined;
+const config = loadConfig(configPath);
+setLogLevel(config.logLevel ?? "info");
+
+const app = createApp(config);
+
+app.listen(config.port, () => {
+  logger.info(`codex-adapter listening on http://localhost:${config.port}`);
+  logger.info(`${config.backends.length} backend(s) configured, default: ${config.defaultBackend}`);
+  for (const b of config.backends) {
+    logger.info(`  [${b.name}] models=${b.models.join(", ")} url=${b.url}`);
+  }
+  logger.info(`Routes: /v1/responses, /v1/models, /v1/messages, /v1/chat/completions`);
+});
