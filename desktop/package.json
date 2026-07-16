@@ -8,8 +8,8 @@
   "scripts": {
     "build": "npm run build --prefix .. && electron-vite build",
     "dev": "npm run build --prefix .. && electron-vite dev",
-    "pack": "npm run build && electron-builder --win --dir",
-    "dist": "npm run build && electron-builder --win --publish never"
+    "pack": "npm run build && electron-builder --win --config electron-builder.yml",
+    "dist": "npm run build && electron-builder --win --publish never --config electron-builder.yml"
   },
   "dependencies": {
     "express": "^5.2.1",

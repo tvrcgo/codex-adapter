@@ -1,0 +1,21 @@
+appId: com.codex-adapter.app
+productName: Codex Adapter
+directories:
+  output: dist
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: ../dist
+    to: dist
+  - from: ../config.example.yml
+    to: config.example.yml
+win:
+  target: nsis
+  sign: null
+  signAndEditExecutable: false
+  artifactName: ${productName}-${version}-setup.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: ${productName}-${version}-setup.${ext}
