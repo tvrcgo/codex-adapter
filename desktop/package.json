@@ -4,12 +4,12 @@
   "private": true,
   "description": "Codex Adapter Electron desktop app",
   "type": "module",
+  "main": "./out/main/index.js",
   "scripts": {
-    "build": "npm run build --prefix ..",
-    "start": "npm run build && electron src/main.mjs",
-    "dev": "npm run build && electron src/main.mjs",
+    "build": "npm run build --prefix .. && electron-vite build",
+    "dev": "npm run build --prefix .. && electron-vite dev",
     "pack": "npm run build && electron-builder --win --dir",
-    "dist": "npm run build --prefix .. && electron-builder --win --publish never"
+    "dist": "npm run build && electron-builder --win --publish never"
   },
   "dependencies": {
     "express": "^5.2.1",
@@ -21,6 +21,7 @@
     "@types/node": "^25.6.0",
     "electron": "^34.5.1",
     "electron-builder": "^25.1.8",
+    "electron-vite": "^5.0.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3"
   }
